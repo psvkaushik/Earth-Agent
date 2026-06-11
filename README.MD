@@ -61,7 +61,7 @@ We introduce Earth-Agent, an EO agent framework cast as a **ReAct-style** Partia
 ## 📦 Data Preparation
 
 ### 1. Download Dataset from Hugging Face
-
+<b>RICCC</b> Make sure you have a huggingface token in the env
 Download the benchmark dataset from Hugging Face:
 
 ```bash
@@ -107,6 +107,17 @@ Earth_Agent/benchmark/
                     ├── image2
                     └── ...
 ```
+
+## RIC
+Just run 
+```pip install -r requirements.txt```
+
+Assuming you have the env setup with eve keys, just run  
+```python langchain_gpt_autoplan.py```
+The results will be saved in ```evaluate_langchain``` folder.
+
+Ignore the later steps for now.....
+
 
 ## 🔧 Configuration
 
