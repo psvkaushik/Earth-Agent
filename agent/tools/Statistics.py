@@ -2635,6 +2635,8 @@ def calculate_band_mean_by_condition(
 
     # Apply mask to target band and calculate mean
     selected_values = target_band[mask]
+    if len(selected_values) == 0:
+        return 0.0
     mean_value = np.nanmean(selected_values)
 
     return float(mean_value)
@@ -2981,7 +2983,11 @@ def subtract(img1_path: str, img2_path: str, output_path: str) -> str:
         profile.update(dtype=rasterio.float32, compress='lzw')
         
         with rasterio.open(output_path, 'w', **profile) as dst:
-            dst.write(result, 1)
+            if result.ndim == 2:
+                dst.write(result, 1)
+            else:
+                # read_image returns (H, W, bands); rasterio expects (bands, H, W)
+                dst.write(np.transpose(result, (2, 0, 1)))
     
     return f'Result save at {TEMP_DIR / output_path}'
 

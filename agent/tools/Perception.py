@@ -388,31 +388,46 @@ def calculate_bbox_area(bboxes, gsd=None):
    
 def get_model_output(model_name: str, input_image_path: str, **args):
     import pandas as pd
+    from pathlib import Path as _Path
 
-    results = pd.read_csv('/root/autodl-tmp/Earth-Agent/benchmark/model_results.csv', sep=';')
+    _csv_path = _Path(__file__).resolve().parent.parent.parent / 'benchmark' / 'model_results.csv'
+    results = pd.read_csv(_csv_path, sep=';')
     result = None
     try:
-        # classification
+        # classification — no text_prompt
         if model_name in ['MSCN', 'RemoteCLIP']:
-            result = results[(results['model'] == model_name) & (results['file_path'] == input_image_path)].values[0]
-        # detection
-        elif model_name == 'Strip-R-CNN':
-            result = results[(results['model'] == model_name) & (results['file_path'] == input_image_path)].values[0]
-        # visual grounding
-        elif model_name == 'RemoteSAM':
-            result = results[(results['model'] == model_name) & (results['file_path'] == input_image_path)].values[0]
-            result = result[args['text_prompt']]
-        # counting
-        elif model_name == 'InstructSAM':
-            result = results[(results['model'] == model_name) & (results['file_path'] == input_image_path)].values[0]
-            result = result[args['text_prompt']]
-        # segmentation
+            filtered = results[(results['model'] == model_name) & (results['file_path'] == input_image_path)]
+            if len(filtered):
+                result = filtered.values[0]
+
+        # detection / grounding / counting — filter by text_prompt
+        elif model_name in ['Strip-R-CNN', 'SM3Det', 'RemoteSAM', 'InstructSAM']:
+            filtered = results[(results['model'] == model_name) &
+                               (results['file_path'] == input_image_path) &
+                               (results['text_prompt'] == args.get('text_prompt', ''))]
+            if len(filtered):
+                result = filtered.values[0]
+
+        # change detection / building extraction
+        elif model_name in ['ChangeOS', 'ChangeOS_Building_Extraction']:
+            if 'post_image_path' in args:
+                lookup_key = f"({input_image_path}, {args['post_image_path']})"
+            else:
+                lookup_key = input_image_path
+            filtered = results[(results['model'] == 'ChangeOS') & (results['file_path'] == lookup_key)]
+            if len(filtered):
+                result = filtered.values[0]
+
+        # SAM2 segmentation
         elif model_name == 'SAM2':
-            result = results[(results['model'] == model_name) & (results['file_path'] == input_image_path)].values[0]
-            result = result[args['bbox']]
-    except:
-        pass
-    
+            filtered = results[(results['model'] == model_name) & (results['file_path'] == input_image_path)]
+            if len(filtered):
+                result = filtered.values[0]
+                result = result[args['bbox']]
+
+    except Exception as e:
+        print(f"get_model_output error ({model_name}): {e}")
+
     if result is None:
         return 'Failed to call model'
     else:

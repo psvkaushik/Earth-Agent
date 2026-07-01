@@ -260,7 +260,7 @@ def run_step_by_step_evaluation(predicted_file: str, ground_truth_file: str) -> 
     }
     
     # Traverse the first 100 questions
-    for question_index, gt_item in list(gt_dict.items())[188:]:
+    for question_index, gt_item in list(gt_dict.items()):
         summary_stats["total_questions"] += 1
         
         if question_index not in pred_dict:

@@ -66,7 +66,7 @@ def calculate_accuracy(ground_truth_data: List[Dict], predicted_data: List[Dict]
         "detailed_results": []
     }
 
-    for question_index, gt_item in list(gt_dict.items())[188:]:
+    for question_index, gt_item in list(gt_dict.items())[:]:
         gt_answer = gt_item.get("final_answer", "")
         if gt_answer is None:
             gt_answer = ""
@@ -151,7 +151,7 @@ def calculate_efficiency_with_tool_calls(ground_truth_data: List[Dict],
         "detailed_results": []
     }
 
-    for question_index, gt_item in list(gt_dict.items())[188:]:
+    for question_index, gt_item in list(gt_dict.items()):
         gt_tool_count = count_tool_calls(gt_item)
         
         if question_index not in model_tool_calls_data:

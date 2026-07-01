@@ -9,6 +9,7 @@ logs/
 .env.*.local
 *.key
 *_secrets.json
+*.log
 
 # Configuration files with API keys (templates are OK)
 agent/config_*.json

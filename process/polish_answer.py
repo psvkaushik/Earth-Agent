@@ -12,8 +12,8 @@ def gpt4o_polish_answer(question, answer):
     Use GPT-4o to extract the final answer from model's response
     """
     # API configuration
-    BASE_URL = ""##TODO: add the base url
-    API_KEY = ''##TODO: add the api key
+    BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    API_KEY = os.getenv("OPENAI_API_KEY", "")
     
     headers = {
         'Authorization': f'Bearer {API_KEY}',

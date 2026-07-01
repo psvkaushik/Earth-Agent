@@ -1,4 +1,6 @@
 import os
+from dotenv import load_dotenv
+load_dotenv()
 os.environ["GTIFF_SRS_SOURCE"]="EPSG"
 import json
 import logging
@@ -26,14 +28,17 @@ logger = None
 temp_dir_path = None
 
 # Configuration
-model_name = 'eve'
-autoplanning = True
+model_name = 'mistral-small'
+autoplanning = False
+# Set to a list of question IDs to re-run only specific questions; None runs all
+RETRY_IDS = None
 sys_prompt = '''
-You are a geoscientist, and you need to use tools to answer multiple-choice questions about Earth observation data analysis. Note that if a tool returns an error, you can only try again once. Ultimately, you only need to explicitly tell me the correct choice.
+You are a geisoscientist, and you need to use tools to answer multiple-choice questions about Earth observation data analysis. Note that if a tool returns an error, you can only try again once. Ultimately, you only need to explicitly tell me the correct choice.
 ATTENTION:
 1. When a tool returns "Result saved at /path/to/file", you must use the full returned path "/path/to/file" in all subsequent tool calls.
 2. For each question, you must provide the choice you think is most appropriate.Don't gibe me another format. Your final answer format must be:
 <Answer>Your choice<Answer>
+3. Before accessing any file in a data directory, always call get_filelist on that directory first to discover the actual filenames. Never assume or guess filenames.
 '''
 
 username = os.getenv("EVE_USERNAME")
@@ -119,11 +124,11 @@ def load_langchain_config(config_path='./agent/config.json'):
     # Initialize OpenAI model with stricter parameters
     model_config = config['models'][0]
     llm_kwargs = {
-        'model': "EVE-Instruct",
+        'model': "Mistral-Small-3.2-24B-Instruct-2506",
         'api_key': "EMPTY",
-        'base_url': os.getenv("EVE_BASE_URL"),
+        'base_url': os.getenv("EVE_ENDPOINT"),
         'temperature': 0,  # Lower temperature for more focused responses
-        'request_timeout': 120,  # 2 minute timeout per request
+        'request_timeout': 300,  # 5 minute timeout per request
         'default_headers': headers
     }
     
@@ -146,10 +151,16 @@ def load_langchain_config(config_path='./agent/config.json'):
             else:
                 updated_args.append(arg)
         
+        server_env = dict(server_config.get('env') or {})
+        ld = os.environ.get("LD_LIBRARY_PATH")
+        if ld:
+            server_env.setdefault("LD_LIBRARY_PATH", ld)
+
         mcp_servers[server_name] = {
             "command": server_config['command'],
             "args": updated_args,
-            "transport": "stdio"
+            "transport": "stdio",
+            "env": server_env,
         }
     
     return llm, mcp_servers
@@ -413,7 +424,10 @@ async def main():
     
     try:
         # Load questions
-        questions = load_questions() # Test all qustions
+        questions = load_questions()
+        if RETRY_IDS is not None:
+            retry_set = set(RETRY_IDS)
+            questions = [q for q in questions if q['question_id'] in retry_set]
         print(f"Loaded {len(questions)} questions for evaluation")
         
         # Process questions
