@@ -32,6 +32,10 @@ model_name = 'mistral-small'
 autoplanning = False
 # Set to a list of question IDs to re-run only specific questions; None runs all
 RETRY_IDS = None
+# Parallel batching: set BATCH_TOTAL > 1 and launch BATCH_TOTAL copies with BATCH_INDEX 0..N-1
+# Each copy handles a non-overlapping slice; merge results_summary.json files afterwards
+BATCH_TOTAL = 1   # total number of parallel workers (1 = no batching)
+BATCH_INDEX = 0   # which slice this worker handles (0-indexed)
 sys_prompt = '''
 You are a geisoscientist, and you need to use tools to answer multiple-choice questions about Earth observation data analysis. Note that if a tool returns an error, you can only try again once. Ultimately, you only need to explicitly tell me the correct choice.
 ATTENTION:
@@ -53,10 +57,12 @@ def init_global_params():
     global temp_dir_path, logger
     
     if temp_dir_path is None:
-        temp_dir_path = Path('./evaluate_langchain/{}_{}_{}'.format(
-            model_name, 
-            'AP' if autoplanning else "IF", 
-            datetime.now().strftime('%y-%m-%d_%H-%M')
+        batch_suffix = f'_b{BATCH_INDEX}of{BATCH_TOTAL}' if BATCH_TOTAL > 1 else ''
+        temp_dir_path = Path('./evaluate_langchain/{}_{}_{}{}' .format(
+            model_name,
+            'AP' if autoplanning else "IF",
+            datetime.now().strftime('%y-%m-%d_%H-%M'),
+            batch_suffix
         )).absolute()
     temp_dir_path.mkdir(parents=True, exist_ok=True)
 
@@ -428,8 +434,11 @@ async def main():
         if RETRY_IDS is not None:
             retry_set = set(RETRY_IDS)
             questions = [q for q in questions if q['question_id'] in retry_set]
-        print(f"Loaded {len(questions)} questions for evaluation")
-        
+        if BATCH_TOTAL > 1:
+            questions = [q for i, q in enumerate(questions) if i % BATCH_TOTAL == BATCH_INDEX]
+        print(f"Loaded {len(questions)} questions for evaluation"
+              + (f" (batch {BATCH_INDEX+1}/{BATCH_TOTAL})" if BATCH_TOTAL > 1 else ""))
+
         # Process questions
         results = []
         for question in tqdm(questions, desc="Processing questions"):
@@ -438,9 +447,6 @@ async def main():
                 "question_id": question['question_id'],
                 "answer": answer
             })
-            
-            # Optional: Add delay between questions to avoid rate limiting
-            await asyncio.sleep(1)
         
         # Save results summary
         results_path = temp_dir_path / "results_summary.json"
