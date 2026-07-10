@@ -5,6 +5,7 @@ os.environ["GTIFF_SRS_SOURCE"]="EPSG"
 import json
 import logging
 import asyncio
+import time
 from enum import auto
 from tqdm import tqdm
 from pathlib import Path
@@ -17,6 +18,7 @@ from langgraph.prebuilt import create_react_agent
 from langchain_openai import ChatOpenAI
 from langchain.schema import HumanMessage
 from langchain_core.tools import tool
+from langchain_core.callbacks import AsyncCallbackHandler
 import base64
 # Pprint for debugging
 from pprint import pprint
@@ -27,6 +29,7 @@ os.chdir(os.path.dirname(os.path.abspath(__file__)))
 # Global variables
 logger = None
 temp_dir_path = None
+debug_trace_path = None  # set once temp_dir_path exists; live LLM/tool/delegate trace goes here
 
 # Configuration
 model_name = 'eve'
@@ -37,6 +40,61 @@ RETRY_IDS = None
 # Each copy handles a non-overlapping slice; merge results_summary.json files afterwards
 BATCH_TOTAL = 1   # total number of parallel workers (1 = no batching)
 BATCH_INDEX = 0   # which slice this worker handles (0-indexed)
+# Debugging: cap the run to the first N questions (after RETRY_IDS/batch filtering) and
+# print a live trace (timestamps + durations) of every LLM call and tool call as it
+# happens, so a slow run can be diagnosed without waiting for it to finish.
+DEBUG_MODE = False
+MAX_QUESTIONS = 1 if DEBUG_MODE else None
+
+
+def _ts() -> str:
+    return datetime.now().strftime('%H:%M:%S.%f')[:-3]
+
+
+def _preview(obj, max_chars: int = 300) -> str:
+    s = str(obj)
+    return s if len(s) <= max_chars else s[:max_chars].rstrip() + '...'
+
+
+def _log_trace(msg: str) -> None:
+    """Append one line to the dedicated debug-trace file, kept separate from stdout so
+    it isn't interleaved with FastMCP's own console logging."""
+    if debug_trace_path is None:
+        print(msg, flush=True)
+        return
+    with open(debug_trace_path, 'a', encoding='utf-8') as f:
+        f.write(msg + '\n')
+
+
+class VerboseCallbackHandler(AsyncCallbackHandler):
+    """Prints a live, timestamped trace of every LLM call made by a given agent
+    (supervisor or one specialist), so you can see exactly what the system is doing
+    (and how long each model round-trip takes) while a run is in progress, instead of
+    only finding out after the whole question completes."""
+
+    def __init__(self, label: str):
+        self.label = label
+        self._start_times = {}
+
+    async def on_chat_model_start(self, serialized, messages, *, run_id, **kwargs):
+        self._start_times[run_id] = time.monotonic()
+        n_msgs = sum(len(batch) for batch in messages)
+        _log_trace(f"[{_ts()}] [{self.label}] LLM call START ({n_msgs} messages)")
+
+    async def on_llm_start(self, serialized, prompts, *, run_id, **kwargs):
+        self._start_times[run_id] = time.monotonic()
+        _log_trace(f"[{_ts()}] [{self.label}] LLM call START")
+
+    async def on_llm_end(self, response, *, run_id, **kwargs):
+        dur = time.monotonic() - self._start_times.pop(run_id, time.monotonic())
+        usage = getattr(response, 'llm_output', None) or {}
+        tokens = usage.get('token_usage') if isinstance(usage, dict) else None
+        tok_str = f", {tokens}" if tokens else ""
+        _log_trace(f"[{_ts()}] [{self.label}] LLM call END ({dur:.1f}s{tok_str})")
+
+    async def on_llm_error(self, error, *, run_id, **kwargs):
+        dur = time.monotonic() - self._start_times.pop(run_id, time.monotonic())
+        _log_trace(f"[{_ts()}] [{self.label}] LLM call ERROR after {dur:.1f}s: {error}")
 # Tool categories: each corresponds to one MCP server in agent/config.json and becomes
 # its own specialist agent, coordinated by a supervisor agent (see create_multi_agent_system).
 CATEGORIES = ["Index", "Inversion", "Perception", "Analysis", "Statistics"]
@@ -160,7 +218,7 @@ headers = {"Authorization": f"Basic {token}"}
 
 def init_global_params():
     """Initialize global parameters and logging"""
-    global temp_dir_path, logger
+    global temp_dir_path, logger, debug_trace_path
 
     if temp_dir_path is None:
         batch_suffix = f'_b{BATCH_INDEX}of{BATCH_TOTAL}' if BATCH_TOTAL > 1 else ''
@@ -171,6 +229,10 @@ def init_global_params():
             batch_suffix
         )).absolute()
     temp_dir_path.mkdir(parents=True, exist_ok=True)
+
+    # Dedicated, FastMCP-free trace of every LLM/tool/delegate call, written live.
+    debug_trace_path = temp_dir_path / "debug_trace.txt"
+    debug_trace_path.write_text("", encoding='utf-8')
 
     class JsonFormatter(logging.Formatter):
         def format(self, record):
@@ -292,13 +354,19 @@ def wrap_tool_with_trace(original_tool, category: str, tool_trace: list):
     async def _traced(**kwargs):
         record = {"agent": category, "name": original_tool.name, "input": kwargs, "output": None, "error": False}
         tool_trace.append(record)
+        _log_trace(f"[{_ts()}] [{category}] TOOL START: {original_tool.name}({_preview(kwargs, 200)})")
+        start = time.monotonic()
         try:
             result = await original_tool.ainvoke(kwargs)
             record["output"] = result
+            dur = time.monotonic() - start
+            _log_trace(f"[{_ts()}] [{category}] TOOL END: {original_tool.name} in {dur:.1f}s -> {_preview(result)}")
             return result
         except Exception as e:
             record["output"] = str(e)
             record["error"] = True
+            dur = time.monotonic() - start
+            _log_trace(f"[{_ts()}] [{category}] TOOL ERROR: {original_tool.name} in {dur:.1f}s -> {e}")
             raise
 
     return StructuredTool.from_function(
@@ -315,18 +383,26 @@ def make_delegate_tool(category: str, specialist_agent):
     description = CATEGORY_INFO[category]["description"]
 
     async def _delegate(task: str) -> str:
+        _log_trace(f"[{_ts()}] [supervisor] DELEGATE START -> {category}: {_preview(task, 200)}")
+        start = time.monotonic()
         try:
             result = await specialist_agent.ainvoke(
                 {"messages": [HumanMessage(content=task)]},
                 config={
                     "recursion_limit": 50,
                     "max_execution_time": 300,
+                    "callbacks": [VerboseCallbackHandler(category)],
                 },
             )
         except Exception as e:
+            dur = time.monotonic() - start
+            _log_trace(f"[{_ts()}] [supervisor] DELEGATE ERROR -> {category} in {dur:.1f}s: {e}")
             return f"Error: {category} agent failed: {e}"
 
-        return extract_answer_from_response(result)
+        dur = time.monotonic() - start
+        answer = extract_answer_from_response(result)
+        _log_trace(f"[{_ts()}] [supervisor] DELEGATE END -> {category} in {dur:.1f}s: {_preview(answer)}")
+        return answer
 
     return tool(tool_name, description=description)(_delegate)
 
@@ -564,6 +640,7 @@ async def handle_question(supervisor, question, chat_log_path, tool_trace):
             config={
                 "recursion_limit": 75,  # supervisor may chain several delegate calls
                 "max_execution_time": 600,  # 10 minutes timeout
+                "callbacks": [VerboseCallbackHandler("supervisor")],
             }
         )
 
@@ -626,6 +703,7 @@ async def main():
     # Initialize chat logger
     chat_log_path = init_chat_logger()
     print(f"Chat log will be saved to: {chat_log_path}")
+    print(f"Live LLM/tool/delegate trace will be saved to: {debug_trace_path}")
 
     # Load configuration and create the supervisor + specialist multi-agent system
     llm, mcp_servers = load_langchain_config()
@@ -639,8 +717,11 @@ async def main():
             questions = [q for q in questions if q['question_id'] in retry_set]
         if BATCH_TOTAL > 1:
             questions = [q for i, q in enumerate(questions) if i % BATCH_TOTAL == BATCH_INDEX]
+        if MAX_QUESTIONS is not None:
+            questions = questions[:MAX_QUESTIONS]
         print(f"Loaded {len(questions)} questions for evaluation"
-              + (f" (batch {BATCH_INDEX+1}/{BATCH_TOTAL})" if BATCH_TOTAL > 1 else ""))
+              + (f" (batch {BATCH_INDEX+1}/{BATCH_TOTAL})" if BATCH_TOTAL > 1 else "")
+              + (f" [DEBUG_MODE: capped to {MAX_QUESTIONS}]" if MAX_QUESTIONS is not None else ""))
 
         # Process questions
         results = []
