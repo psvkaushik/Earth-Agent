@@ -1,15 +1,12 @@
 import os
 from dotenv import load_dotenv
 load_dotenv()
-os.environ["GTIFF_SRS_SOURCE"]="EPSG"
+os.environ["GTIFF_SRS_SOURCE"] = "EPSG"
 import json
 import logging
 import asyncio
-import time
-from enum import auto
 from tqdm import tqdm
 from pathlib import Path
-from copy import deepcopy
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 
@@ -17,212 +14,109 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.prebuilt import create_react_agent
 from langchain_openai import ChatOpenAI
 from langchain.schema import HumanMessage
-from langchain_core.tools import tool
-from langchain_core.callbacks import AsyncCallbackHandler
+from langchain_core.tools import StructuredTool
+from langchain_core.callbacks import BaseCallbackHandler
+from pydantic import BaseModel, Field
 import base64
-# Pprint for debugging
-from pprint import pprint
 
 # Change to current directory
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
+# ============================================================================
 # Global variables
+# ============================================================================
 logger = None
 temp_dir_path = None
-debug_trace_path = None  # set once temp_dir_path exists; live LLM/tool/delegate trace goes here
 
 # Configuration
 model_name = 'eve'
 autoplanning = True
-# Set to a list of question IDs to re-run only specific questions; None runs all
 RETRY_IDS = None
-# Parallel batching: set BATCH_TOTAL > 1 and launch BATCH_TOTAL copies with BATCH_INDEX 0..N-1
-# Each copy handles a non-overlapping slice; merge results_summary.json files afterwards
-BATCH_TOTAL = 1   # total number of parallel workers (1 = no batching)
-BATCH_INDEX = 0   # which slice this worker handles (0-indexed)
-# Debugging: cap the run to the first N questions (after RETRY_IDS/batch filtering) and
-# print a live trace (timestamps + durations) of every LLM call and tool call as it
-# happens, so a slow run can be diagnosed without waiting for it to finish.
-DEBUG_MODE = False
-MAX_QUESTIONS = 1 if DEBUG_MODE else None
+BATCH_TOTAL = 1
+BATCH_INDEX = 0
 
 
-def _ts() -> str:
-    return datetime.now().strftime('%H:%M:%S.%f')[:-3]
+_current_subagent_traces = []
 
+_kit_message_history = {}
 
-def _preview(obj, max_chars: int = 300) -> str:
-    s = str(obj)
-    return s if len(s) <= max_chars else s[:max_chars].rstrip() + '...'
-
-
-def _log_trace(msg: str) -> None:
-    """Append one line to the dedicated debug-trace file, kept separate from stdout so
-    it isn't interleaved with FastMCP's own console logging."""
-    if debug_trace_path is None:
-        print(msg, flush=True)
-        return
-    with open(debug_trace_path, 'a', encoding='utf-8') as f:
-        f.write(msg + '\n')
-
-
-class VerboseCallbackHandler(AsyncCallbackHandler):
-    """Prints a live, timestamped trace of every LLM call made by a given agent
-    (supervisor or one specialist), so you can see exactly what the system is doing
-    (and how long each model round-trip takes) while a run is in progress, instead of
-    only finding out after the whole question completes."""
-
-    def __init__(self, label: str):
-        self.label = label
-        self._start_times = {}
-
-    async def on_chat_model_start(self, serialized, messages, *, run_id, **kwargs):
-        self._start_times[run_id] = time.monotonic()
-        n_msgs = sum(len(batch) for batch in messages)
-        _log_trace(f"[{_ts()}] [{self.label}] LLM call START ({n_msgs} messages)")
-
-    async def on_llm_start(self, serialized, prompts, *, run_id, **kwargs):
-        self._start_times[run_id] = time.monotonic()
-        _log_trace(f"[{_ts()}] [{self.label}] LLM call START")
-
-    async def on_llm_end(self, response, *, run_id, **kwargs):
-        dur = time.monotonic() - self._start_times.pop(run_id, time.monotonic())
-        usage = getattr(response, 'llm_output', None) or {}
-        tokens = usage.get('token_usage') if isinstance(usage, dict) else None
-        tok_str = f", {tokens}" if tokens else ""
-        _log_trace(f"[{_ts()}] [{self.label}] LLM call END ({dur:.1f}s{tok_str})")
-
-    async def on_llm_error(self, error, *, run_id, **kwargs):
-        dur = time.monotonic() - self._start_times.pop(run_id, time.monotonic())
-        _log_trace(f"[{_ts()}] [{self.label}] LLM call ERROR after {dur:.1f}s: {error}")
-# Tool categories: each corresponds to one MCP server in agent/config.json and becomes
-# its own specialist agent, coordinated by a supervisor agent (see create_multi_agent_system).
-CATEGORIES = ["Index", "Inversion", "Perception", "Analysis", "Statistics"]
-
-CATEGORY_INFO = {
-    "Index": {
-        "description": "Computes spectral indices from remote sensing imagery: NDVI, NDWI, NDBI, EVI, NBR, FVC, WRI, NDTI, FRP, NDSI, TVDI, extreme snow-loss percentage, and their batch variants.",
-    },
-    "Inversion": {
-        "description": "Performs physical parameter inversion/retrieval from remote sensing data: land surface temperature (single/multi-channel, split-window, temperature-emissivity separation, day/night, TTM), band ratio, ATI, SAR dual-polarization/dual-frequency/multi-frequency features, sea-ice concentration, water turbidity.",
-    },
-    "Perception": {
-        "description": "Performs image perception tasks: thresholding/segmentation, bounding-box geometry (expansion, area), object counting, centroid extraction and centroid-to-centroid distance (closest/farthest pair), skeleton analysis, foundation-model inference (RemoteCLIP, Strip R-CNN, SM3Det, RemoteSAM, InstructSAM, SAM2), and change detection (ChangeOS). This is the ONLY category with spatial/geometric tools -- any task involving distances, areas, or positions derived from detections or bounding boxes belongs here, not Statistics.",
-    },
-    "Analysis": {
-        "description": "Performs statistical/time-series trend analysis: linear trend, Mann-Kendall test, Sen's slope, STL decomposition, change-point detection, autocorrelation, seasonality detection, and hotspot (Getis-Ord Gi*) analysis and direction.",
-    },
-    "Statistics": {
-        "description": "Computes descriptive statistics over flat numeric lists and raster/image pixel values (mean, std, median, min, max, sum, skewness, kurtosis, coefficient of variation, hotspot percentage/maps), simple scalar arithmetic (difference, division, multiply, percentage change, Kelvin-to-Celsius), and generic file utilities including get_filelist for discovering filenames in a data directory. Has NO addition or square-root tool, so it cannot compute Euclidean distances or sums of two values -- and has no spatial/geometric tools at all (use Perception for anything involving bounding boxes, centroids, or distances between detected objects).",
-    },
-}
-
-COMMON_ATTENTION = '''ATTENTION:
-1. When a tool returns "Result saved at /path/to/file", you must use the full returned path "/path/to/file" in all subsequent tool calls.
-2. If a tool returns an error, you may only retry that exact call once.
-3. Before accessing any file in a data directory, always call get_filelist on that directory first to discover the actual filenames. Never assume or guess filenames.
-4. You must only report numeric values that were actually returned by one of your tool calls. If none of your available tools can compute a value you need, say so explicitly and stop -- do not compute it yourself in prose. A supervisor will re-route the sub-task if your toolset can't cover it.'''
-
-
-def format_tool_entry(t, max_desc_chars=160):
-    """One line 'name(arg: type, ...) -- short description' for a single tool, built
-    directly from its real MCP-reported args and description, so this can never drift
-    out of sync with the underlying server code."""
-    try:
-        props = t.args or {}
-    except Exception:
-        props = {}
-    arg_strs = []
-    for pname, pinfo in props.items():
-        ptype = pinfo.get('type', 'any') if isinstance(pinfo, dict) else 'any'
-        arg_strs.append(f"{pname}: {ptype}")
-    signature = f"{t.name}({', '.join(arg_strs)})"
-
-    # MCP tool descriptions are often multi-line with a leading "Description:" header;
-    # pull out the first substantive line for a compact one-liner.
-    desc_lines = [ln.strip() for ln in (t.description or '').strip().splitlines() if ln.strip()]
-    desc_lines = [ln for ln in desc_lines if ln.lower() not in ('description:',)]
-    short_desc = desc_lines[0] if desc_lines else ''
-    if len(short_desc) > max_desc_chars:
-        short_desc = short_desc[:max_desc_chars].rstrip() + '...'
-
-    return f"- {signature} -- {short_desc}"
-
-
-def format_tool_inventory(tools) -> str:
-    """Bullet-list inventory of every tool available to a specialist: real name, real
-    argument names/types, and a short purpose line -- built from live MCP metadata."""
-    return '\n'.join(format_tool_entry(t) for t in tools)
-
-
-def format_tool_name_manifest(tools) -> str:
-    """Comma-separated tool names only. Used in the supervisor prompt so it knows each
-    specialist's exact capabilities without bloating the prompt with full descriptions."""
-    return ', '.join(t.name for t in tools)
-
-
-def build_specialist_prompt(category: str, tools) -> str:
-    """System prompt for the specialist agent that owns one tool category. `tools` is
-    the specialist's actual (untraced) tool list, used to render a live inventory."""
-    return f'''You are a geoscientist specialized in the "{category}" toolset for Earth observation data analysis.
-{CATEGORY_INFO[category]["description"]}
-
-Your available tools (exact name, arguments, and purpose):
-{format_tool_inventory(tools)}
-
-You have been delegated a specific sub-task by a supervising agent. Before doing any
-calculation yourself, check whether one of the tools above -- possibly chained across
-several calls -- already produces the value directly (e.g. converting detections to
-centroids and then to distances is two chained tool calls, not manual math). Prefer
-chaining your own tools over improvising arithmetic in prose. Use your tools to
-complete the task as accurately and completely as possible, then report your findings
-(including any computed values and output file paths) in clear prose. You do not need
-to produce a final multiple-choice answer yourself, just report what you found.
-{COMMON_ATTENTION}'''
-
-
-def build_supervisor_prompt(tools_by_category) -> str:
-    """System prompt for the supervisor. `tools_by_category` maps each category to its
-    actual (untraced) tool list, used to render a per-specialist tool-name manifest so
-    the supervisor can route sub-tasks to whichever specialist can actually finish
-    them, instead of splitting a task across specialists based on category vibes."""
-    delegate_lines = []
-    for category in CATEGORIES:
-        names = format_tool_name_manifest(tools_by_category[category])
-        delegate_lines.append(
-            f'- delegate_to_{category.lower()}_agent: {CATEGORY_INFO[category]["description"]}\n'
-            f'  Tools it has access to: {names}'
-        )
-    delegate_block = '\n'.join(delegate_lines)
-
-    return f'''You are a lead geoscientist coordinating a team of specialist agents to answer multiple-choice questions about Earth observation data analysis. You have no data-processing tools of your own, you can only delegate sub-tasks to these specialist agents, each wrapping one category of tools:
-
-{delegate_block}
-
-Specialists cannot see the original question or each other's work, only what you pass them. For each delegate call, include all the context that specialist needs (the data directory/paths, prior results it should use, and the exact sub-task).
-
-ROUTING RULE: check each specialist's tool list above before delegating. If one specialist's own tools can carry a sub-task all the way through to the final derived value (for example: detecting objects, converting them to centroids, and computing the distance between the two farthest all live in Perception), delegate that whole sub-task to them in a single call rather than splitting it across specialists. Splitting forces the receiving specialist to improvise arithmetic instead of using a purpose-built tool, which produces unreliable numbers. Only split a task across specialists when the categories genuinely don't overlap (e.g. computing NDVI in Index, then trend-testing the NDVI time series in Analysis).
-
-Chain calls as needed, feeding one specialist's results into the next.
-ATTENTION:
-1. If a delegate call returns an error, you may only retry that exact call once.
-2. Once you have enough information, your FINAL turn must be plain text only, with no further tool calls, containing exactly:
-<Answer>Your choice</Answer>'''
 
 username = os.getenv("EVE_USERNAME")
 password = os.getenv("EVE_PASSWORD")
-
 token = base64.b64encode(f"{username}:{password}".encode()).decode()
 headers = {"Authorization": f"Basic {token}"}
 
 
-def init_global_params():
-    """Initialize global parameters and logging"""
-    global temp_dir_path, logger, debug_trace_path
+KIT_SPECS = {
+    "index": {
+        "match_keywords": ["index"],
+        "description": "spectral indices (e.g. NDVI, NDWI, NBR, NDBI, EVI)",
+    },
+    "inversion": {
+        "match_keywords": ["inversion"],
+        "description": "geophysical parameter retrieval (e.g. land surface temperature, soil moisture)",
+    },
+    "perception": {
+        "match_keywords": ["perception"],
+        "description": "image perception (scene classification, object detection, segmentation)",
+    },
+    "analysis": {
+        "match_keywords": ["analysis", "analytic"],
+        "description": "spatiotemporal analysis (trend detection, seasonality, change-point detection, spatial autocorrelation)",
+    },
+    "statistics": {
+        "match_keywords": ["statistic", "stats"],
+        "description": "pixel/batch statistics, thresholding, image algebra, cloud masking, and get_filelist",
+    },
+}
 
+
+SPECIALIST_PROMPT_TEMPLATE = '''
+You are a geoscientist, and you need to use tools to complete a sub-task about Earth observation data analysis given to you by a lead agent. You have access to tools for {tools_desc}, plus get_filelist. Note that if a tool returns an error, you can only try again once. Report your result clearly, including any output file paths, so the lead agent can use it.
+ATTENTION:
+1. When a tool returns "Result saved at /path/to/file", you must use the full returned path "/path/to/file" in all subsequent tool calls.
+2. The lead agent's instructions will always include the data directory path for this question, and, whenever relevant, the exact file paths that have already been retrieved or produced -- either filenames the lead agent already discovered, or paths a specialist previously reported back to it (e.g. "Result saved at ..."). Treat those paths as given: use them exactly as written, never re-verify them, and never assume, guess, or slightly alter a path you were not actually given.
+3. Only call get_filelist yourself if the instructions you received contain NO usable file paths at all -- i.e. only a bare directory, with no filenames and no previously retrieved paths to work from. If any paths are already present in what you were given, use those directly instead of calling get_filelist.
+4. Before processing multiple files, check whether a batch version of the tool exists (e.g. a tool literally named calculate_batch_X, or a parameter typed as a list/array) and use it to handle all the files in one call. Only call a tool once per file, one by one, if no batch option exists for that specific operation -- don't default to looping if a batch tool is available. Also check whether a tool's parameters are file paths or require the data loaded into memory first. If you are unsure what a tool accepts, check its documentation rather than guessing.
+5. If you're unable to answer a question with the available tools, report the limitation clearly, do not guess any answer or hallucinate.
+'''
+
+for _kit, _spec in KIT_SPECS.items():
+    _spec["system_prompt"] = SPECIALIST_PROMPT_TEMPLATE.format(tools_desc=_spec["description"])
+
+# Same as the original single-agent sys_prompt, with one addition: a list of
+# the five delegation tools in place of the flat toolset.
+ORCHESTRATOR_SYS_PROMPT = '''
+You are a geisoscientist, and you need to use tools to answer multiple-choice questions about Earth observation data analysis. Note that if a tool returns an error, you can only try again once. Ultimately, you only need to explicitly tell me the correct choice.
+
+You have access to five tools, each delegating a sub-task to a specialist agent with its own set of underlying tools:
+- call_index_kit: to calculate spectral indices (e.g. NDVI, NDWI, NBR, NDBI, EVI)
+- call_inversion_kit: geophysical parameter retrieval (e.g. land surface temperature, soil moisture)
+- call_perception_kit: image perception (scene classification, object detection, segmentation)
+- call_analysis_kit: spatiotemporal analysis (trend detection, seasonality, change-point detection, spatial autocorrelation)
+- call_statistics_kit: pixel/batch statistics, thresholding, image algebra, cloud masking, and get_filelist
+Each specialist remembers its own earlier calls within this question (so you can tell it "as before" or point out a prior error), but it does not see your reasoning or other specialists' results unless you include them in the instructions you give it.
+
+ATTENTION:
+1. When a tool returns "Result saved at /path/to/file", you must use the full returned path "/path/to/file" in all subsequent tool calls.
+2. For each question, you must provide the choice you think is most appropriate. Don't gibe me another format. Your final answer format must be:
+<Answer>Your choice<Answer>
+3. There are two directories you must keep track of throughout the question and pass to specialists as needed:
+   (a) The INPUT data directory for this question (given in the question text) -- pass this to any specialist that needs to read the original source files.
+   (b) The OUTPUT directory where specialists save results -- the first time any specialist reports "Result saved at /some/path/file.tif", note the directory that path lives in; specialist outputs generally land in that same output directory for the rest of the question. When a later specialist needs a file another specialist produced, give it that exact full output path, not just a directory -- specialists cannot see each other's results, so you must copy the exact path over yourself. Never invent or modify a path.
+4. If a specialist is unable to attend to your query and states its limitation, try a different specialist instead. If none of the specialists can answer, report the limitation clearly, do not get stuck in a loop calling the same specialist, do not guess any answer or hallucinate.
+5. Tell each specialist WHAT you need, not HOW to do it. Describe the goal (e.g. "compute the dryness index for this NDVI/LST time series and give me its annual trend") and give it the context it needs (paths, dates, region), but do not specify formulas, algorithms, step-by-step methods, or which exact tool it should call. The specialist knows its own tools and how to use them correctly -- if you specify the method yourself, you risk describing the wrong formula and the specialist following it instead of using the correct tool for the job.
+'''
+
+# ============================================================================
+# Logging (unchanged in spirit from the single-agent version)
+# ============================================================================
+
+def init_global_params():
+    global temp_dir_path, logger
     if temp_dir_path is None:
         batch_suffix = f'_b{BATCH_INDEX}of{BATCH_TOTAL}' if BATCH_TOTAL > 1 else ''
-        temp_dir_path = Path('./evaluate_langchain/{}_{}_{}{}' .format(
+        temp_dir_path = Path('./evaluate_langchain/{}_{}_{}{}'.format(
             model_name,
             'AP' if autoplanning else "IF",
             datetime.now().strftime('%y-%m-%d_%H-%M'),
@@ -230,51 +124,134 @@ def init_global_params():
         )).absolute()
     temp_dir_path.mkdir(parents=True, exist_ok=True)
 
-    # Dedicated, FastMCP-free trace of every LLM/tool/delegate call, written live.
-    debug_trace_path = temp_dir_path / "debug_trace.txt"
-    debug_trace_path.write_text("", encoding='utf-8')
-
     class JsonFormatter(logging.Formatter):
         def format(self, record):
-            # Simplified logging compatible with original format
             log_record = {
                 "question_index": record.args[0] if record.args else "unknown",
                 "timestamp": self.formatTime(record, self.datefmt),
                 "conversations": record.args[1] if len(record.args) > 1 else [],
-                "final_answer": record.args[2] if len(record.args) > 2 else None,
-                "tool_call_order": record.args[3] if len(record.args) > 3 else [],
+                "final_answer": record.args[2] if len(record.args) > 2 else None
             }
             return json.dumps(log_record, ensure_ascii=False, indent=4)
 
     logger = logging.getLogger("text_logger")
     logger.setLevel(logging.INFO)
     handler = RotatingFileHandler(
-        temp_dir_path / "{}_{}_langchain.log".format(
-            model_name, 'AP' if autoplanning else "IF"
-        )
+        temp_dir_path / "{}_{}_langchain.log".format(model_name, 'AP' if autoplanning else "IF")
     )
     handler.setFormatter(JsonFormatter())
     logger.addHandler(handler)
-
     return temp_dir_path, logger
 
 
 def init_chat_logger():
-    """Initialize chat logger for .chat file like AgentScope"""
     global temp_dir_path
-    chat_log_path = temp_dir_path / "{}_{}_langchain.chat".format(
-        model_name, 'AP' if autoplanning else "IF"
-    )
-    return chat_log_path
+    return temp_dir_path / "{}_{}_langchain.chat".format(model_name, 'AP' if autoplanning else "IF")
+
+
+def init_trace_logger():
+    """Plain-text, human-readable trace: one entry per question showing the
+    full call tree (orchestrator turns -> delegations -> each specialist's
+    own tool calls/results -> final answer). Complements the JSON .log
+    (machine-parseable) and the AgentScope-style .chat file (replay format)
+    with something you can just open and skim."""
+    global temp_dir_path
+    return temp_dir_path / "{}_{}_trace.txt".format(model_name, 'AP' if autoplanning else "IF")
+
+
+def render_log_entries(entries, indent=0):
+    """Render a conversation_log-shaped list (user/assistant/tool/specialist
+    entries, as built in handle_question) into indented plain-text lines.
+    Recurses into "specialist" entries since their "content" is itself a
+    list of the same-shaped entries (see response_to_trace)."""
+    pad = "    " * indent
+    lines = []
+    for entry in entries:
+        role = entry.get("role")
+        if role == "user":
+            lines.append(f"{pad}[USER] {entry.get('content')}")
+        elif role == "assistant":
+            for item in entry.get("content", []):
+                if item.get("type") == "text":
+                    lines.append(f"{pad}[ASSISTANT] {item.get('content')}")
+                elif "name" in item:
+                    try:
+                        args_str = json.dumps(item.get("input", {}), ensure_ascii=False)
+                    except TypeError:
+                        args_str = str(item.get("input", {}))
+                    lines.append(f"{pad}[ASSISTANT -> CALL] {item['name']}({args_str})")
+        elif role == "tool":
+            try:
+                output_text = entry["content"][0]["output"][0]["text"]
+            except Exception:
+                output_text = str(entry.get("content"))
+            lines.append(f"{pad}[TOOL RESULT: {entry.get('name')}] {output_text}")
+        elif role == "specialist":
+            kit_label = entry.get("kit", "?").upper()
+            lines.append(f"{pad}--- {kit_label} SPECIALIST ---")
+            lines.extend(render_log_entries(entry.get("content", []), indent=indent + 1))
+            lines.append(f"{pad}--- end {kit_label} ---")
+        else:
+            lines.append(f"{pad}[{role}] {entry}")
+    return lines
+
+
+def format_conversation_log_as_text(question_id, conversation_log, final_answer) -> str:
+    """Structured recap written once the question finishes -- comes AFTER
+    the real-time [HH:MM:SS] stream (written live by TraceCallbackHandler /
+    write_trace as each call happens) and organizes the same events into a
+    clean, indented tree for a quicker read after the fact."""
+    lines = []
+    lines.append("-" * 100)
+    lines.append(f"Question ID: {question_id}    SUMMARY  "
+                 f"(structured recap of the run above)  "
+                 f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append("-" * 100)
+    lines.extend(render_log_entries(conversation_log))
+    lines.append("-" * 100)
+    lines.append(f"FINAL ANSWER: {final_answer}")
+    lines.append("=" * 100)
+    lines.append("")  # blank separator line between questions
+    return "\n".join(lines)
+
+
+def write_trace(trace_log_path, text: str):
+    with open(trace_log_path, 'a', encoding='utf-8') as f:
+        f.write(text + "\n")
+
+
+class TraceCallbackHandler(BaseCallbackHandler):
+    """Writes each tool call and its result to the trace .txt file the
+    MOMENT it happens, instead of buffering everything until the whole
+    question (or whole specialist delegation) finishes. One instance is
+    scoped to a label ("ORCHESTRATOR" or a kit name like "INDEX") so you can
+    tell, in real time, who is calling what -- including a specialist's own
+    internal tool calls while it's still working, before it has returned
+    anything back to the orchestrator."""
+
+    def __init__(self, trace_log_path, label: str):
+        self.trace_log_path = trace_log_path
+        self.label = label
+
+    def _write(self, line: str):
+        write_trace(self.trace_log_path, line)
+
+    def on_tool_start(self, serialized, input_str, **kwargs):
+        name = (serialized or {}).get("name", "unknown_tool")
+        ts = datetime.now().strftime('%H:%M:%S')
+        self._write(f"[{ts}] [{self.label}] -> CALL {name}({input_str})")
+
+    def on_tool_end(self, output, **kwargs):
+        ts = datetime.now().strftime('%H:%M:%S')
+        self._write(f"[{ts}] [{self.label}] <- RESULT {output}")
+
+    def on_tool_error(self, error, **kwargs):
+        ts = datetime.now().strftime('%H:%M:%S')
+        self._write(f"[{ts}] [{self.label}] <- ERROR {error}")
 
 
 def save_chat_message(chat_log_path, message_data):
-    """Save a single chat message to .chat file in AgentScope format"""
-    import time
-    from datetime import datetime
     import uuid
-
-    # Format message in AgentScope style
     chat_record = {
         "__module__": "langchain.schema.messages",
         "__name__": "ChatMessage",
@@ -285,38 +262,34 @@ def save_chat_message(chat_log_path, message_data):
         "metadata": message_data.get('metadata', None),
         "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     }
-
-    # Append to chat file (one JSON per line, like AgentScope)
     with open(chat_log_path, 'a', encoding='utf-8') as f:
         f.write(json.dumps(chat_record, ensure_ascii=False) + '\n')
 
 
+# ============================================================================
+# Config / MCP loading
+# ============================================================================
+
 def load_langchain_config(config_path='./agent/config.json'):
-    """Load configuration and initialize LangChain components"""
     with open(config_path, 'r') as f:
         config = json.load(f)
 
-    # Initialize OpenAI model with stricter parameters
     model_config = config['models'][0]
     llm_kwargs = {
         'model': "EVE-Instruct",
         'api_key': "EMPTY",
         'base_url': os.getenv("EVE_ENDPOINT"),
-        'temperature': 0,  # Lower temperature for more focused responses
-        'request_timeout': 300,  # 5 minute timeout per request
+        'temperature': 0,
+        'request_timeout': 300,
         'default_headers': headers
     }
-
-    # Add generate_args via extra_body if present in config
     if 'generate_args' in model_config:
         llm_kwargs['extra_body'] = model_config['generate_args']
 
     llm = ChatOpenAI(**llm_kwargs)
 
-    # Prepare MCP servers configuration
     mcp_servers = {}
     for server_name, server_config in config['mcpServers'].items():
-        # Update paths to use current temp directory
         updated_args = []
         for arg in server_config['args']:
             if 'tmp/tmp/out' in arg:
@@ -341,119 +314,315 @@ def load_langchain_config(config_path='./agent/config.json'):
     return llm, mcp_servers
 
 
-def wrap_tool_with_trace(original_tool, category: str, tool_trace: list):
-    """Wrap a real MCP tool so every invocation is recorded, in true call order, into
-    tool_trace. This is what lets us reconstruct "the order the tools were called in"
-    reliably even though the tools now live behind several specialist agents instead of
-    one flat agent, and even if a supervisor turn fans out to more than one specialist
-    concurrently (list.append below happens synchronously at call time, before the
-    await, so entry order always matches invocation order regardless of which call
-    finishes first)."""
-    from langchain_core.tools import StructuredTool
+def assign_servers_to_kits(mcp_servers: dict):
+    """Map each configured MCP server name to a kit based on KIT_SPECS
+    keywords. Prints a loud warning for anything that doesn't match so
+    mis-mapping is easy to spot before a run burns API calls."""
+    kit_to_servers = {kit: [] for kit in KIT_SPECS}
+    unmatched = []
 
-    async def _traced(**kwargs):
-        record = {"agent": category, "name": original_tool.name, "input": kwargs, "output": None, "error": False}
-        tool_trace.append(record)
-        _log_trace(f"[{_ts()}] [{category}] TOOL START: {original_tool.name}({_preview(kwargs, 200)})")
-        start = time.monotonic()
-        try:
-            result = await original_tool.ainvoke(kwargs)
-            record["output"] = result
-            dur = time.monotonic() - start
-            _log_trace(f"[{_ts()}] [{category}] TOOL END: {original_tool.name} in {dur:.1f}s -> {_preview(result)}")
-            return result
-        except Exception as e:
-            record["output"] = str(e)
-            record["error"] = True
-            dur = time.monotonic() - start
-            _log_trace(f"[{_ts()}] [{category}] TOOL ERROR: {original_tool.name} in {dur:.1f}s -> {e}")
-            raise
+    for server_name in mcp_servers:
+        matched_kit = None
+        lowered = server_name.lower()
+        for kit, spec in KIT_SPECS.items():
+            if any(kw in lowered for kw in spec["match_keywords"]):
+                matched_kit = kit
+                break
+        if matched_kit:
+            kit_to_servers[matched_kit].append(server_name)
+        else:
+            unmatched.append(server_name)
 
-    return StructuredTool.from_function(
-        coroutine=_traced,
-        name=original_tool.name,
-        description=original_tool.description,
-        args_schema=original_tool.args_schema,
+    print("\n=== Kit <-> MCP server mapping ===")
+    for kit, servers in kit_to_servers.items():
+        print(f"  {kit:11s} -> {servers if servers else '!!! NO SERVER MATCHED !!!'}")
+    if unmatched:
+        print(f"  (unmatched servers, available to ALL kits + orchestrator as shared utilities): {unmatched}")
+    print("===================================\n")
+
+    for kit, servers in kit_to_servers.items():
+        if not servers:
+            print(f"WARNING: kit '{kit}' matched no MCP server. Check KIT_SPECS['{kit}']"
+                  f"['match_keywords'] against your agent/config.json server names.")
+
+    return kit_to_servers, unmatched
+
+
+# Tools that should be available to every kit specialist AND the
+# orchestrator, regardless of which MCP server happens to host them.
+# get_filelist lives in tools/Statistics.py, but every kit's system prompt
+# requires calling it before touching a data directory, so it must be
+# universally available rather than exclusive to the Statistics specialist.
+SHARED_TOOL_NAMES = {"get_filelist"}
+
+
+async def load_tools_per_kit(client: MultiServerMCPClient, mcp_servers: dict):
+    kit_to_servers, unmatched_servers = assign_servers_to_kits(mcp_servers)
+
+    # Load every server's tools once.
+    tools_by_server = {}
+    for server_name in mcp_servers:
+        tools_by_server[server_name] = await client.get_tools(server_name=server_name)
+
+    # Pull out the tools that must be shared everywhere (e.g. get_filelist),
+    # no matter which server they live on.
+    shared_tools = []
+    for server_name, tools in tools_by_server.items():
+        for tool in tools:
+            if tool.name in SHARED_TOOL_NAMES:
+                shared_tools.append(tool)
+    if shared_tools:
+        print(f"  Shared across all agents (found on their home server, "
+              f"reused everywhere): {[t.name for t in shared_tools]}")
+    else:
+        print("  WARNING: none of SHARED_TOOL_NAMES were found in any server's "
+              "tool list — get_filelist (or equivalent) won't be available.")
+
+    # Tools from servers that didn't match any kit keyword are ALSO treated
+    # as shared utilities, in case your config.json adds a server this
+    # script doesn't know about.
+    for server_name in unmatched_servers:
+        shared_tools.extend(tools_by_server[server_name])
+
+    kit_tools = {}
+    for kit, servers in kit_to_servers.items():
+        tools = list(shared_tools)  # everyone gets the shared utilities (incl. get_filelist)
+        for server_name in servers:
+            tools.extend(tools_by_server[server_name])
+        # de-dupe by tool name in case a kit's own server also hosts a
+        # "shared" tool (e.g. Statistics hosting get_filelist itself)
+        seen = set()
+        deduped = []
+        for tool in tools:
+            if tool.name not in seen:
+                seen.add(tool.name)
+                deduped.append(tool)
+        kit_tools[kit] = deduped
+
+    return kit_tools, shared_tools
+
+
+# ============================================================================
+# Sub-agent construction + "agent as tool" wrapping
+# ============================================================================
+
+def response_to_trace(response):
+    """Convert a sub-agent's raw message list into the same lightweight
+    conversation_log structure used for the top-level log, so it can be
+    merged in later."""
+    trace = []
+    for message in response.get("messages", []):
+        if not hasattr(message, 'type'):
+            continue
+        if message.type == 'human':
+            trace.append({"role": "user", "content": message.content})
+        elif message.type == 'ai':
+            content = []
+            if message.content and message.content.strip():
+                content.append({"type": "text", "content": message.content})
+            if hasattr(message, 'additional_kwargs') and 'tool_calls' in message.additional_kwargs:
+                for tool_call in message.additional_kwargs['tool_calls']:
+                    try:
+                        arguments = json.loads(tool_call['function']['arguments']) \
+                            if isinstance(tool_call['function']['arguments'], str) \
+                            else tool_call['function']['arguments']
+                    except Exception:
+                        arguments = tool_call['function']['arguments']
+                    content.append({"name": tool_call['function']['name'], "input": arguments})
+            if content:
+                trace.append({"role": "assistant", "content": content})
+        elif message.type == 'tool':
+            trace.append({
+                "role": "tool",
+                "name": message.name,
+                "content": [{"output": [{"text": str(message.content)}]}]
+            })
+    return trace
+
+
+DELEGATION_TOOL_PREFIX = "call_"
+DELEGATION_TOOL_SUFFIX = "_kit"
+
+
+def _is_delegation_wrapper(tool_name: str) -> bool:
+    """True for orchestrator-level delegation tools (call_index_kit, etc.)
+    -- these aren't real domain tools, they're just the plumbing that
+    routes to a specialist. Downstream tooling (extraction/eval scripts
+    written against the single-agent log format) expects only real tool
+    calls, so these wrappers get dropped from the .log output."""
+    return tool_name.startswith(DELEGATION_TOOL_PREFIX) and tool_name.endswith(DELEGATION_TOOL_SUFFIX)
+
+
+def flatten_tool_calls(conversation_log):
+    """Flatten a (possibly nested) multi-agent conversation_log into a
+    single chronological list containing only real tool calls/results --
+    matching the shape the single-agent script's .log file already has.
+
+    Two things happen here:
+    1. "specialist" entries (a kit's nested sub-trace) are recursed into
+       and their contents spliced in at the point the delegation occurred,
+       instead of being nested under a "specialist" wrapper.
+    2. The delegation wrapper calls themselves (call_index_kit,
+       call_analysis_kit, ...) and their results are dropped -- they are
+       not real tools and would not match ground truth built against a
+       single-agent tool sequence. The specialist's own real tool calls
+       (get_filelist, compute_tvdi, mann_kendall_test, ...) take their
+       place in the flattened sequence.
+
+    User/text-only assistant turns pass through unchanged, same as the
+    single-agent log."""
+    flat = []
+    for entry in conversation_log:
+        role = entry.get("role")
+        if role == "specialist":
+            flat.extend(flatten_tool_calls(entry.get("content", [])))
+        elif role == "assistant":
+            kept = []
+            for item in entry.get("content", []):
+                if item.get("type") == "text":
+                    kept.append(item)
+                elif "name" in item:
+                    if _is_delegation_wrapper(item["name"]):
+                        continue  # drop the wrapper call itself
+                    kept.append(item)
+            if kept:
+                flat.append({"role": "assistant", "content": kept})
+        elif role == "tool":
+            if _is_delegation_wrapper(entry.get("name", "")):
+                continue  # drop the wrapper's result; real results already spliced in above
+            flat.append(entry)
+        else:
+            flat.append(entry)
+    return flat
+
+
+def format_specialist_return(new_messages) -> str:
+    """Format the messages generated during ONE delegation call (this turn's
+    AI text, tool calls, and tool results) into a single string for the
+    orchestrator. Deliberately close to a raw ReAct trace rather than a
+    paraphrased summary, so if a tool call failed, the orchestrator sees the
+    actual tool error text directly -- the same signal it would have seen
+    itself in the single-agent version -- instead of the specialist's
+    interpretation of what went wrong."""
+    lines = []
+    for message in new_messages:
+        if not hasattr(message, 'type'):
+            continue
+        if message.type == 'ai':
+            if message.content and message.content.strip():
+                lines.append(message.content.strip())
+            if hasattr(message, 'additional_kwargs') and 'tool_calls' in message.additional_kwargs:
+                for tool_call in message.additional_kwargs['tool_calls']:
+                    lines.append(f"[called {tool_call['function']['name']}"
+                                 f"({tool_call['function']['arguments']})]")
+        elif message.type == 'tool':
+            lines.append(f"[{message.name} returned] {message.content}")
+    return "\n".join(lines) if lines else "(specialist made no tool calls or produced no output)"
+
+
+def build_kit_subagents(llm, kit_tools: dict):
+    """Create one ReAct agent per kit, each scoped to that kit's tools and
+    given its specialist system prompt."""
+    subagents = {}
+    for kit, tools in kit_tools.items():
+        spec = KIT_SPECS[kit]
+        # Fold the specialist system prompt in as the leading message via
+        # state_modifier / prompt kwarg supported by create_react_agent.
+        subagents[kit] = create_react_agent(llm, tools, prompt=spec["system_prompt"])
+        print(f"  Built '{kit}' sub-agent with {len(tools)} tools")
+    return subagents
+
+
+class KitDelegationInput(BaseModel):
+    instructions: str = Field(
+        description=(
+            "Full, self-contained instructions for the specialist. Describe "
+            "the goal (WHAT you need), not the method (HOW to do it) -- no "
+            "formulas, algorithms, or tool names; the specialist knows its "
+            "own tools. Must always include: the data directory path for "
+            "this question, and the exact file paths relevant to this "
+            "sub-task -- either filenames you discovered via get_filelist "
+            "or paths a specialist previously reported back to you (e.g. "
+            "'Result saved at ...'). Never invent, guess, or alter a path. "
+            "If a path came from another specialist's earlier result, copy "
+            "it in verbatim, since specialists cannot see each other's work."
+        )
     )
 
 
-def make_delegate_tool(category: str, specialist_agent):
-    """Wrap a specialist agent as a tool the supervisor can call by category name."""
-    tool_name = f"delegate_to_{category.lower()}_agent"
-    description = CATEGORY_INFO[category]["description"]
+def make_kit_tool(kit_name: str, subagent, trace_log_path) -> StructuredTool:
+    spec = KIT_SPECS[kit_name]
+    kit_callback = TraceCallbackHandler(trace_log_path, label=kit_name.upper())
 
-    async def _delegate(task: str) -> str:
-        _log_trace(f"[{_ts()}] [supervisor] DELEGATE START -> {category}: {_preview(task, 200)}")
-        start = time.monotonic()
-        try:
-            result = await specialist_agent.ainvoke(
-                {"messages": [HumanMessage(content=task)]},
-                config={
-                    "recursion_limit": 50,
-                    "max_execution_time": 300,
-                    "callbacks": [VerboseCallbackHandler(category)],
-                },
-            )
-        except Exception as e:
-            dur = time.monotonic() - start
-            _log_trace(f"[{_ts()}] [supervisor] DELEGATE ERROR -> {category} in {dur:.1f}s: {e}")
-            return f"Error: {category} agent failed: {e}"
+    async def _run(instructions: str) -> str:
+        # Reuse this kit's accumulated message history (if any) from earlier
+        # delegations within the same question, so the specialist has real
+        # memory: it can see what it already tried, what already failed,
+        # and what files/results it already produced, instead of starting
+        # from a blank slate every single delegation. What it does with
+        # that memory (retry, skip, change approach) is left to the model,
+        # same as the single-agent script left "retry only once" to the
+        # model rather than enforcing it in code.
+        history = _kit_message_history.setdefault(kit_name, [])
+        pre_call_len = len(history)
+        history.append(HumanMessage(content=instructions))
 
-        dur = time.monotonic() - start
-        answer = extract_answer_from_response(result)
-        _log_trace(f"[{_ts()}] [supervisor] DELEGATE END -> {category} in {dur:.1f}s: {_preview(answer)}")
-        return answer
+        write_trace(trace_log_path, f"[{datetime.now().strftime('%H:%M:%S')}] "
+                    f"[ORCHESTRATOR] delegating to {kit_name.upper()}: {instructions}")
 
-    return tool(tool_name, description=description)(_delegate)
+        response = await subagent.ainvoke(
+            {"messages": history},
+            config={"recursion_limit": 30, "max_execution_time": 180, "callbacks": [kit_callback]},
+        )
+        _kit_message_history[kit_name] = response["messages"]
+
+        _current_subagent_traces.append({
+            "kit": kit_name,
+            "trace": response_to_trace(response),
+        })
+
+        # Return this turn's tool calls/results, not a paraphrase of them --
+        # if a tool call failed, the orchestrator sees the actual error text.
+        new_messages = response["messages"][pre_call_len:]
+        return format_specialist_return(new_messages)
+
+    return StructuredTool.from_function(
+        name=f"call_{kit_name}_kit",
+        description=(
+            f"Delegate a sub-task to the {kit_name.upper()} specialist. "
+            f"Covers {spec['description']}. Pass complete, self-contained "
+            f"instructions -- this specialist remembers its OWN earlier "
+            f"delegations within this question, but it does NOT see your "
+            f"reasoning or other specialists' work unless you include it."
+        ),
+        args_schema=KitDelegationInput,
+        coroutine=_run,
+    )
 
 
-async def create_multi_agent_system(llm, mcp_servers):
-    """Create a supervisor agent plus one specialist ReAct agent per tool category
-    (Index, Inversion, Perception, Analysis, Statistics), each restricted to its own MCP server's tools."""
+async def create_multi_agent_system(llm, mcp_servers, trace_log_path):
+    """Build the full supervisor + 5-specialist system and return the
+    orchestrator agent plus the underlying MCP client (for cleanup)."""
     client = MultiServerMCPClient(mcp_servers)
-
     try:
-        raw_tools_by_category = {}
-        for category in CATEGORIES:
-            raw_tools_by_category[category] = await client.get_tools(server_name=category)
-            print(f"Loaded {len(raw_tools_by_category[category])} tools for the {category} agent")
+        kit_tools, shared_tools = await load_tools_per_kit(client, mcp_servers)
 
-        # Share the generic file-listing utility (lives in the Statistics server) with every
-        # specialist, since each of them is instructed to call get_filelist before touching files.
-        filelist_tool = next((t for t in raw_tools_by_category["Statistics"] if t.name == "get_filelist"), None)
+        print("Building kit specialist sub-agents...")
+        subagents = build_kit_subagents(llm, kit_tools)
 
-        # Every real tool call (regardless of which specialist makes it) is recorded here,
-        # in true chronological call order, so downstream logging doesn't have to
-        # reconstruct order from the agent-of-agents message structure.
-        tool_trace = []
+        kit_tool_wrappers = [
+            make_kit_tool(kit, agent, trace_log_path) for kit, agent in subagents.items()
+        ]
 
-        # Untraced tool lists (real name/args/description) are kept around purely to
-        # render accurate prompt text -- the agents themselves run on the traced copies.
-        tools_by_category = {}
-        traced_tools_by_category = {}
-        for category in CATEGORIES:
-            category_tools = list(raw_tools_by_category[category])
-            if filelist_tool and category != "Statistics":
-                category_tools.append(filelist_tool)
-            tools_by_category[category] = category_tools
-            traced_tools_by_category[category] = [wrap_tool_with_trace(t, category, tool_trace) for t in category_tools]
+        orchestrator_tools = kit_tool_wrappers# + shared_tools
+        orchestrator = create_react_agent(llm, orchestrator_tools, prompt=ORCHESTRATOR_SYS_PROMPT)
 
-        specialists = {
-            category: create_react_agent(
-                llm,
-                traced_tools_by_category[category],
-                prompt=build_specialist_prompt(category, tools_by_category[category]),
-                name=f"{category.lower()}_agent",
-            )
-            for category in CATEGORIES
-        }
+        total_tools = sum(len(t) for t in kit_tools.values()) #+ len(shared_tools)
+        print(f"Successfully loaded {total_tools} underlying MCP tools across "
+              f"{len(subagents)} specialists + orchestrator "
+              f"({len(orchestrator_tools)} orchestrator-level tools)")
 
-        worker_tools = [make_delegate_tool(category, specialists[category]) for category in CATEGORIES]
-
-        supervisor_prompt = build_supervisor_prompt(tools_by_category)
-        supervisor = create_react_agent(llm, worker_tools, prompt=supervisor_prompt, name="supervisor")
-
-        return supervisor, client, tool_trace
+        return orchestrator, client
     except Exception as e:
         print(f"Error creating multi-agent system: {e}")
         if hasattr(client, 'close'):
@@ -461,8 +630,11 @@ async def create_multi_agent_system(llm, mcp_servers):
         raise
 
 
+# ============================================================================
+# Questions
+# ============================================================================
+
 def load_questions(test_json_path: str = 'benchmark/question.json'):
-    """Load evaluation questions"""
     with open(test_json_path, 'r') as f:
         test_json = json.load(f)
 
@@ -471,7 +643,6 @@ def load_questions(test_json_path: str = 'benchmark/question.json'):
         AP_INDEX = 0 if question_info['evaluation'][0]['type'] == 'autonomous planning' else 1
         data = question_info['evaluation'][AP_INDEX].get('data', None)
         data = question_info['evaluation'][1 - AP_INDEX].get('data', None) if data is None else data
-
         if data is None:
             continue
         out.append({
@@ -481,16 +652,11 @@ def load_questions(test_json_path: str = 'benchmark/question.json'):
             "data": data,
             "choices": question_info.get('choices', None)
         })
-
     return out
 
 
 def extract_answer_from_response(response):
-    """Extract just the parsed choice from the final answer (used for grading /
-    results_summary.json, and as the return value fed back to the supervisor by a
-    delegate call)."""
     messages = response.get("messages", [])
-
     for message in reversed(messages):
         if hasattr(message, 'type') and message.type == 'ai':
             content = message.content
@@ -499,240 +665,215 @@ def extract_answer_from_response(response):
                 end = content.find('</Answer>')
                 return content[start:end].strip()
             return content
-
     return "No answer found"
 
 
-def get_final_message_content(response):
-    """Raw content of the last AI message, completely untouched (tags and all). This is
-    what goes into the JSON log's `final_answer` field, to match the old single-agent
-    log format, which logged the raw final message rather than a parsed choice."""
-    messages = response.get("messages", [])
-    for message in reversed(messages):
-        if hasattr(message, 'type') and message.type == 'ai':
-            return message.content
-    return ""
+# ============================================================================
+# Question handling
+# ============================================================================
 
+async def handle_question(orchestrator, question, chat_log_path, trace_log_path):
+    global _current_subagent_traces, _kit_message_history
+    _current_subagent_traces = []
+    _kit_message_history = {}
 
-def build_conversation_log(query, tool_call_order, final_content):
-    """Build the JSON log's `conversations` field to match the old single-agent shape:
-    one user turn, then one assistant(tool-call)/tool(result) pair per REAL tool
-    invocation (flattened across whichever specialist made it), in true chronological
-    order, then a final assistant text turn. This intentionally ignores the
-    supervisor/specialist delegate-call framing -- the log should look the same
-    whether the question was answered by one flat agent or by several behind the
-    scenes."""
-    log = [{"role": "user", "content": query}]
+    try:
+        query = question['auto'] + question['data'] if autoplanning else \
+            question['instruct'] + question['data']
 
-    for call in tool_call_order:
-        log.append({
-            "role": "assistant",
-            "content": [{"name": call["name"], "input": call["input"]}]
-        })
-        log.append({
-            "role": "tool",
-            "name": call["name"],
-            "content": [{"output": [{"text": str(call["output"])}]}]
-        })
+        if question['choices']:
+            query += '\n'.join([''] + [
+                '{}.{}'.format(chr(ord('A') + i), choice)
+                for i, choice in enumerate(question['choices'])
+            ])
 
-    log.append({
-        "role": "assistant",
-        "content": [{"type": "text", "content": final_content}]
-    })
+        full_query = query  # ORCHESTRATOR_SYS_PROMPT is already bound via `prompt=`
 
-    return log
+        print(f"\n--- Processing Question {question['question_id']} ---")
+        print(f"Query: {query[:200]}...")
 
+        write_trace(trace_log_path, "\n" + "=" * 100 +
+                    f"\nQuestion ID: {question['question_id']}    "
+                    f"START {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n" + "=" * 100 +
+                    f"\n[USER] {full_query}")
 
-def save_transcript_to_chat(chat_log_path, label, messages):
-    """Save a linear message list's AI/tool messages to the .chat file, tagged with `label`."""
-    for message in messages:
-        if not hasattr(message, 'type') or message.type == 'human':
-            continue
+        user_message = {
+            "name": "user",
+            "role": "user",
+            "content": full_query,
+            "metadata": {"question_id": question['question_id']}
+        }
+        save_chat_message(chat_log_path, user_message)
 
-        if message.type == 'ai':
-            assistant_chat_content = []
-            if message.content and message.content.strip():
-                assistant_chat_content.append({"type": "text", "text": message.content})
+        orch_callback = TraceCallbackHandler(trace_log_path, label="ORCHESTRATOR")
+        response = await orchestrator.ainvoke(
+            {"messages": [HumanMessage(content=full_query)]},
+            config={"recursion_limit": 50, "max_execution_time": 600, "callbacks": [orch_callback]},
+        )
 
-            if hasattr(message, 'additional_kwargs') and 'tool_calls' in message.additional_kwargs:
-                for tool_call in message.additional_kwargs['tool_calls']:
-                    try:
-                        arguments = json.loads(tool_call['function']['arguments']) if isinstance(tool_call['function']['arguments'], str) else tool_call['function']['arguments']
-                    except:
-                        arguments = tool_call['function']['arguments']
-                    assistant_chat_content.append({
-                        "type": "tool_use",
-                        "id": tool_call['id'],
-                        "name": tool_call['function']['name'],
-                        "input": arguments
+        final_answer = extract_answer_from_response(response)
+
+        # ---- Build conversation_log: orchestrator turns, with each
+        # delegation call's specialist trajectory inlined right after it. ----
+        conversation_log = []
+        trace_iter = iter(_current_subagent_traces)
+
+        for message in response.get("messages", []):
+            if not hasattr(message, 'type'):
+                continue
+            if message.type == 'human':
+                conversation_log.append({"role": "user", "content": message.content})
+            elif message.type == 'ai':
+                assistant_content = []
+                if message.content and message.content.strip():
+                    assistant_content.append({"type": "text", "content": message.content})
+                delegated_this_turn = False
+                if hasattr(message, 'additional_kwargs') and 'tool_calls' in message.additional_kwargs:
+                    for tool_call in message.additional_kwargs['tool_calls']:
+                        try:
+                            arguments = json.loads(tool_call['function']['arguments']) \
+                                if isinstance(tool_call['function']['arguments'], str) \
+                                else tool_call['function']['arguments']
+                        except Exception:
+                            arguments = tool_call['function']['arguments']
+                        assistant_content.append({"name": tool_call['function']['name'], "input": arguments})
+                        if tool_call['function']['name'].startswith('call_') and tool_call['function']['name'].endswith('_kit'):
+                            delegated_this_turn = True
+                if assistant_content:
+                    conversation_log.append({"role": "assistant", "content": assistant_content})
+                if delegated_this_turn:
+                    sub = next(trace_iter, None)
+                    if sub is not None:
+                        conversation_log.append({
+                            "role": "specialist",
+                            "kit": sub["kit"],
+                            "content": sub["trace"],
+                        })
+            elif message.type == 'tool':
+                conversation_log.append({
+                    "role": "tool",
+                    "name": message.name,
+                    "content": [{"output": [{"text": str(message.content)}]}]
+                })
+
+        # Any remaining specialist traces (e.g. parallel/edge cases) appended at the end
+        for sub in trace_iter:
+            conversation_log.append({"role": "specialist", "kit": sub["kit"], "content": sub["trace"]})
+
+        # ---- .chat file (AgentScope-style) ----
+        for message in response.get("messages", []):
+            if not hasattr(message, 'type'):
+                continue
+            if message.type == 'human':
+                continue
+            elif message.type == 'ai':
+                assistant_chat_content = []
+                if message.content and message.content.strip():
+                    assistant_chat_content.append({"type": "text", "text": message.content})
+                if hasattr(message, 'additional_kwargs') and 'tool_calls' in message.additional_kwargs:
+                    for tool_call in message.additional_kwargs['tool_calls']:
+                        try:
+                            arguments = json.loads(tool_call['function']['arguments']) \
+                                if isinstance(tool_call['function']['arguments'], str) \
+                                else tool_call['function']['arguments']
+                        except Exception:
+                            arguments = tool_call['function']['arguments']
+                        assistant_chat_content.append({
+                            "type": "tool_use",
+                            "id": tool_call['id'],
+                            "name": tool_call['function']['name'],
+                            "input": arguments
+                        })
+                if assistant_chat_content:
+                    save_chat_message(chat_log_path, {
+                        "name": question['question_id'],
+                        "role": "assistant",
+                        "content": assistant_chat_content,
+                        "metadata": None
                     })
-
-            if assistant_chat_content:
+            elif message.type == 'tool':
                 save_chat_message(chat_log_path, {
-                    "name": label,
-                    "role": "assistant",
-                    "content": assistant_chat_content,
+                    "name": "system",
+                    "role": "system",
+                    "content": [{
+                        "type": "tool_result",
+                        "id": getattr(message, 'tool_call_id', 'unknown'),
+                        "output": [{"type": "text", "text": str(message.content), "annotations": None, "meta": None}],
+                        "name": message.name
+                    }],
                     "metadata": None
                 })
 
-        elif message.type == 'tool':
+        # Persist specialist trajectories to the .chat file too
+        for sub in _current_subagent_traces:
             save_chat_message(chat_log_path, {
-                "name": "system",
-                "role": "system",
-                "content": [{
-                    "type": "tool_result",
-                    "id": getattr(message, 'tool_call_id', 'unknown'),
-                    "output": [{"type": "text", "text": str(message.content), "annotations": None, "meta": None}],
-                    "name": message.name
-                }],
-                "metadata": {"agent": label}
+                "name": f"{sub['kit']}_specialist",
+                "role": "specialist",
+                "content": sub["trace"],
+                "metadata": {"question_id": question['question_id'], "kit": sub["kit"]}
             })
 
-
-def save_tool_trace_to_chat(chat_log_path, tool_calls):
-    """Save the flat, true-call-order record of real tool invocations (across every
-    specialist) to the .chat file, one entry per call, tagged with which specialist
-    agent made it."""
-    for call in tool_calls:
-        save_chat_message(chat_log_path, {
-            "name": call["name"],
-            "role": "tool",
-            "content": [{
-                "type": "tool_result",
-                "input": call["input"],
-                "output": [{"type": "text", "text": str(call["output"])}],
-                "is_error": call["error"],
-            }],
-            "metadata": {"agent": call["agent"]}
-        })
-
-
-async def handle_question(supervisor, question, chat_log_path, tool_trace):
-    """Handle a single question with the supervisor + specialist multi-agent system"""
-    query = question['auto'] + question['data'] if autoplanning else \
-        question['instruct'] + question['data']
-
-    if question['choices']:
-        query += '\n'.join([''] + [
-            '{}.{}'.format(chr(ord('A') + i), choice)
-            for i, choice in enumerate(question['choices'])
-        ])
-
-    print(f"\n--- Processing Question {question['question_id']} ---")
-    print(f"Query: {query[:200]}...")
-
-    # Save user message to chat log
-    user_message = {
-        "name": "user",
-        "role": "user",
-        "content": query,
-        "metadata": {"question_id": question['question_id']}
-    }
-    save_chat_message(chat_log_path, user_message)
-
-    # Each question gets a clean slate of real tool-call traces
-    tool_trace.clear()
-
-    try:
-        # Invoke the supervisor agent with configuration to prevent infinite loops
-        response = await supervisor.ainvoke(
-            {"messages": [HumanMessage(content=query)]},
-            config={
-                "recursion_limit": 75,  # supervisor may chain several delegate calls
-                "max_execution_time": 600,  # 10 minutes timeout
-                "callbacks": [VerboseCallbackHandler("supervisor")],
-            }
-        )
-
-        # Parsed choice (e.g. "C") -- used for grading / results_summary.json
-        final_answer = extract_answer_from_response(response)
-        # Raw final message content (e.g. "...<Answer>C</Answer>") -- used for the JSON log,
-        # to match the old single-agent log format
-        final_content = get_final_message_content(response)
-
-        # tool_trace is already in true call order (see wrap_tool_with_trace): this is
-        # the order the real tools were invoked in, independent of which specialist agent
-        # made the call. Copy it now, before the next question clears it.
-        tool_call_order = [
-            {"agent": call["agent"], "name": call["name"], "input": call["input"], "output": call["output"], "error": call["error"]}
-            for call in tool_trace
-        ]
-
-        # JSON log: flattened real tool-call trace in the old single-agent shape
-        conversation_log = build_conversation_log(query, tool_call_order, final_content)
-
-        # .chat file: supervisor-level transcript, plus each real tool call in true order
-        save_transcript_to_chat(chat_log_path, "supervisor", response.get("messages", []))
-        save_tool_trace_to_chat(chat_log_path, tool_call_order)
-
-        # Log the conversation in the old format (raw final_content), plus the tool-call order
-        logger.info("Chat Content", question['question_id'], conversation_log, final_content, tool_call_order)
+        # The JSON .log gets a flattened, tool-calls-only view (matching
+        # the single-agent log shape) so downstream extraction/eval
+        # scripts see the real domain tool sequence regardless of which
+        # specialist made each call. The readable .txt trace keeps the
+        # nested "specialist" grouping since that's more useful to skim.
+        flattened_log = flatten_tool_calls(conversation_log)
+        logger.info("Chat Content", question['question_id'], flattened_log, final_answer)
+        write_trace(trace_log_path, format_conversation_log_as_text(
+            question['question_id'], conversation_log, final_answer
+        ))
 
         print(f"Final Answer: {final_answer}")
-        print(f"Tool calls in order: {[c['name'] for c in tool_call_order]}")
         return final_answer
 
     except Exception as e:
         error_msg = f"Error processing question {question['question_id']}: {e}"
         print(error_msg)
-
-        # Save error to chat log
-        error_message = {
+        save_chat_message(chat_log_path, {
             "name": "system",
             "role": "system",
             "content": [{"type": "text", "content": error_msg}],
             "metadata": {"error": True, "question_id": question['question_id']}
-        }
-        save_chat_message(chat_log_path, error_message)
-
-        # Fixed: previously this was logger.info(question['question_id'], [], error_msg),
-        # which mis-shifted args (question_id became the log msg, error_msg became
-        # `final_answer`... actually landed in `conversations`). Now matches the schema:
-        # (msg, question_id, conversations, final_answer, tool_call_order).
-        logger.info("Chat Content", question['question_id'], [], error_msg, [])
+        })
+        logger.info(question['question_id'], [], error_msg)
+        write_trace(trace_log_path, format_conversation_log_as_text(
+            question['question_id'], [], error_msg
+        ))
         return f"Error: {e}"
 
 
+# ============================================================================
+# Main
+# ============================================================================
+
 async def main():
-    """Main evaluation function"""
-    print("Initializing LangChain-based Earth Science Agent...")
+    print("Initializing multi-agent (supervisor + 5 kit specialists) Earth Science Agent...")
 
-    # Initialize global parameters
     init_global_params()
-
-    # Initialize chat logger
     chat_log_path = init_chat_logger()
+    trace_log_path = init_trace_logger()
     print(f"Chat log will be saved to: {chat_log_path}")
-    print(f"Live LLM/tool/delegate trace will be saved to: {debug_trace_path}")
+    print(f"Human-readable trace will be saved to: {trace_log_path}")
 
-    # Load configuration and create the supervisor + specialist multi-agent system
     llm, mcp_servers = load_langchain_config()
-    supervisor, client, tool_trace = await create_multi_agent_system(llm, mcp_servers)
+    orchestrator, client = await create_multi_agent_system(llm, mcp_servers, trace_log_path)
 
     try:
-        # Load questions
-        questions = load_questions()
+        questions = load_questions()[:10]
         if RETRY_IDS is not None:
             retry_set = set(RETRY_IDS)
             questions = [q for q in questions if q['question_id'] in retry_set]
         if BATCH_TOTAL > 1:
             questions = [q for i, q in enumerate(questions) if i % BATCH_TOTAL == BATCH_INDEX]
-        if MAX_QUESTIONS is not None:
-            questions = questions[:MAX_QUESTIONS]
         print(f"Loaded {len(questions)} questions for evaluation"
-              + (f" (batch {BATCH_INDEX+1}/{BATCH_TOTAL})" if BATCH_TOTAL > 1 else "")
-              + (f" [DEBUG_MODE: capped to {MAX_QUESTIONS}]" if MAX_QUESTIONS is not None else ""))
+              + (f" (batch {BATCH_INDEX+1}/{BATCH_TOTAL})" if BATCH_TOTAL > 1 else ""))
 
-        # Process questions
         results = []
         for question in tqdm(questions, desc="Processing questions"):
-            answer = await handle_question(supervisor, question, chat_log_path, tool_trace)
-            results.append({
-                "question_id": question['question_id'],
-                "answer": answer
-            })
+            answer = await handle_question(orchestrator, question, chat_log_path, trace_log_path)
+            results.append({"question_id": question['question_id'], "answer": answer})
 
-        # Save results summary
         results_path = temp_dir_path / "results_summary.json"
         with open(results_path, 'w', encoding='utf-8') as f:
             json.dump(results, f, ensure_ascii=False, indent=4)
@@ -740,13 +881,13 @@ async def main():
         print(f"\nEvaluation completed! Results saved to {results_path}")
         print(f"Detailed logs available at: {temp_dir_path}")
         print(f"Chat history saved to: {chat_log_path}")
+        print(f"Human-readable trace saved to: {trace_log_path}")
 
     except Exception as e:
         print(f"Error in main evaluation: {e}")
         raise
 
     finally:
-        # Clean up
         if hasattr(client, 'close'):
             await client.close()
 
