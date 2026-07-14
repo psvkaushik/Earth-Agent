@@ -911,7 +911,7 @@ async def main():
     )
 
     try:
-        questions = load_questions()[:6]
+        questions = load_questions()
         if RETRY_IDS is not None:
             retry_set = set(RETRY_IDS)
             questions = [q for q in questions if q['question_id'] in retry_set]
