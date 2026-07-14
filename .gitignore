@@ -3,6 +3,11 @@ benchmark/data/
 evaluate_langchain/
 logs/
 
+# Evaluation run outputs (raw transcripts/logs/results, regenerable per-run)
+results/
+evaluate/batch_step_by_step_results.json
+evaluate/plots/
+
 # Environment variables and secrets
 .env
 .env.local
@@ -54,3 +59,5 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+batch_workers/

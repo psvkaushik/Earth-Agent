@@ -28,8 +28,8 @@ logger = None
 temp_dir_path = None
 
 # Configuration
-model_name = 'mistral-small'
-autoplanning = False
+model_name = 'eve'
+autoplanning = True
 # Set to a list of question IDs to re-run only specific questions; None runs all
 RETRY_IDS = None
 # Parallel batching: set BATCH_TOTAL > 1 and launch BATCH_TOTAL copies with BATCH_INDEX 0..N-1
@@ -130,11 +130,12 @@ def load_langchain_config(config_path='./agent/config.json'):
     # Initialize OpenAI model with stricter parameters
     model_config = config['models'][0]
     llm_kwargs = {
-        'model': "Mistral-Small-3.2-24B-Instruct-2506",
+        'model': "EVE-Instruct",
         'api_key': "EMPTY",
         'base_url': os.getenv("EVE_ENDPOINT"),
-        'temperature': 0,  # Lower temperature for more focused responses
-        'request_timeout': 300,  # 5 minute timeout per request
+        'temperature': 0,
+        'max_tokens': 2048,
+        'request_timeout': 300,
         'default_headers': headers
     }
     
@@ -264,12 +265,12 @@ async def handle_question(agent, question, chat_log_path):
         save_chat_message(chat_log_path, user_message)
         
         # Invoke agent with configuration to prevent infinite loops
-        response = await agent.ainvoke(
-            {"messages": [HumanMessage(content=full_query)]},
-            config={
-                "recursion_limit": 50,  # Increase recursion limit
-                "max_execution_time": 300,  # 5 minutes timeout
-            }
+        response = await asyncio.wait_for(
+            agent.ainvoke(
+                {"messages": [HumanMessage(content=full_query)]},
+                config={"recursion_limit": 50},
+            ),
+            timeout=900,  # 15 min hard cap per question
         )
         
         # Extract final answer
@@ -427,7 +428,15 @@ async def main():
     # Load configuration and create agent
     llm, mcp_servers = load_langchain_config()
     agent, client = await create_langchain_agent(llm, mcp_servers)
-    
+
+    # Warm-up: send a trivial request so the connection pool is ready before Q1
+    print("Warming up connection...")
+    try:
+        await asyncio.wait_for(llm.ainvoke("Hi"), timeout=120)
+        print("Warm-up complete.")
+    except Exception as e:
+        print(f"Warm-up failed (continuing anyway): {e}")
+
     try:
         # Load questions
         questions = load_questions()
