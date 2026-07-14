@@ -178,6 +178,7 @@ ATTENTION:
 13. When you produce many output files in one sub-task, state the common output directory ONCE, clearly and explicitly (e.g. "All outputs saved under: /abs/path/to/dir"), in addition to any individual paths you list. The lead agent has to extract this directory from your report to pass it to the next specialist -- if it's only implied by a long list of individual full paths (especially a truncated one), it's easy to lose. Note if the output directory differs from the input directory you were given, since it usually will.
 14. If a directory you were given (or its get_filelist listing) does not contain files matching what your instructions describe -- e.g. you were asked to use files with a certain name pattern, but the directory only contains files with a different name or extension -- do NOT invent a plausible-looking filename and try it anyway. Report back exactly what that directory actually contains and state clearly that the expected files are missing, so the lead agent knows to check whether it gave you the correct path (per rule 2, only ever reuse a path you were actually given verbatim -- this includes not "correcting" a given path into a guessed one).
 15. If one or more points in a data series could not be computed (missing/invalid/no-data), never place a placeholder word or phrase (e.g. "no valid data", "N/A", "error") inside what is otherwise a numeric array you pass into a tool call -- a tool expecting a list of numbers will fail on that, and can break the whole run rather than just that one data point. When calling a tool, pass only the clean numeric values (dropping the missing point(s) from the array), and separately state in your own report -- in prose, not inside the array -- which date/index was dropped and why, so the lead agent (and any specialist it relays this to) has that context without it corrupting a numeric argument.
+16. Never pass more than 15 file paths in a single tool call argument, even to a batch-capable tool. If you have more than 15 relevant files, split the work into multiple sequential calls of at most 15 paths each. This keeps each tool call's arguments short enough to generate reliably -- very long, repetitive argument lists are more likely to come out malformed and cause the whole call to fail.
 '''
 
 for _kit, _spec in KIT_SPECS.items():
@@ -910,7 +911,7 @@ async def main():
     )
 
     try:
-        questions = load_questions()
+        questions = load_questions()[:6]
         if RETRY_IDS is not None:
             retry_set = set(RETRY_IDS)
             questions = [q for q in questions if q['question_id'] in retry_set]
