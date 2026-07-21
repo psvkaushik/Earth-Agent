@@ -1,44 +1,4 @@
-"""
-ADK (Agent Development Kit) port of the LangChain/LangGraph multi-agent
-Earth Science evaluation script.
 
-Architecture, preserved 1:1 from the original:
-  - One ORCHESTRATOR LlmAgent that never touches raw MCP tools directly.
-  - Five KIT SPECIALIST LlmAgents (index / inversion / perception /
-    analysis / statistics), each scoped to its own MCP tools + the shared
-    get_filelist tool.
-  - The orchestrator "calls" a specialist through a delegation tool
-    (call_index_kit, call_inversion_kit, ...). Each specialist keeps its
-    OWN conversation memory across delegations *within the same question*
-    (matching the original `_kit_message_history` dict), but does not see
-    the orchestrator's reasoning or other specialists' work unless the
-    orchestrator explicitly includes it in the instructions it passes.
-
-IMPORTANT DESIGN NOTE ON "REMEMBERING OUTPUT PATHS":
-  The original script's rule ("once a specialist reports
-  'Result saved at /some/path', remember that output directory and pass
-  the exact path to the next specialist that needs it") is NOT reimplemented
-  as string-parsing / path-tracking code here. It never was: in the
-  original it was a PROMPT instruction (ORCHESTRATOR_SYS_PROMPT rule #3),
-  enforced by the model reading its own conversation history. That is
-  preserved as-is below -- the orchestrator's ADK session naturally
-  accumulates every tool (specialist) result, including any "Result saved
-  at ..." text, so the model can copy paths forward itself. Do not add
-  code that regexes for "Result saved at" and auto-injects paths into the
-  next delegation call -- that would silently paper over cases where the
-  model is supposed to be doing this reasoning itself, and it would break
-  the moment a tool's wording changes.
-
-VERSION NOTE:
-  Written against `google-adk` (the `google.adk` package) as of early/mid
-  2026 APIs (LlmAgent, MCPToolset w/ tool_filter, FunctionTool, Runner,
-  InMemorySessionService, LiteLlm). MCP toolset construction in particular
-  has churned across ADK releases -- if `MCPToolset(connection_params=...)`
-  doesn't match your installed version, check
-  `google.adk.tools.mcp_tool.mcp_toolset` for the current signature; the
-  rest of the script (kit assignment, tool distribution, delegation tools,
-  tracing, logging) does not depend on that detail.
-"""
 
 import os
 from dotenv import load_dotenv
@@ -461,13 +421,24 @@ def load_adk_config(config_path='./agent/config.json'):
     model_config = config['models'][0]
     llm_kwargs = dict(model_config.get('generate_args', {}))
     llm = LiteLlm(
-        model="openai/EVE-Instruct",
-        api_base=os.getenv("EVE_ENDPOINT"),
-        api_key="EMPTY",
-        temperature=0,
-        extra_headers=EVE_HEADERS,
-        **llm_kwargs,
-    )
+    model="openai/EVE-Instruct",
+    api_base=os.getenv("EVE_ENDPOINT"),
+    api_key="EMPTY",
+    temperature=0,
+    extra_headers=EVE_HEADERS,
+    timeout=120,        # hard ceiling per LLM call, in seconds
+    num_retries=1,       # don't let litellm silently retry-and-wait multiple times on top of that
+    max_tokens=4096,     # caps generation length — also curbs the "list all 85 paths" runaway case
+    **llm_kwargs,
+)
+    # llm = LiteLlm(
+    #     model="openai/EVE-Instruct",
+    #     api_base=os.getenv("EVE_ENDPOINT"),
+    #     api_key="EMPTY",
+    #     temperature=0,
+    #     extra_headers=EVE_HEADERS,
+    #     **llm_kwargs,
+    # )
 
     mcp_server_params = {}
     for server_name, server_config in config['mcpServers'].items():

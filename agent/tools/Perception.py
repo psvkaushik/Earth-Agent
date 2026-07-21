@@ -386,52 +386,113 @@ def calculate_bbox_area(bboxes, gsd=None):
     
     return total_area
    
+# def get_model_output(model_name: str, input_image_path: str, **args):
+#     import pandas as pd
+#     from pathlib import Path as _Path
+
+#     _csv_path = _Path(__file__).resolve().parent.parent.parent / 'benchmark' / 'model_results.csv'
+#     results = pd.read_csv(_csv_path, sep=';')
+#     result = None
+#     try:
+#         # classification — no text_prompt
+#         if model_name in ['MSCN', 'RemoteCLIP']:
+#             filtered = results[(results['model'] == model_name) & (results['file_path'] == input_image_path)]
+#             if len(filtered):
+#                 result = filtered.values[0]
+
+#         # detection / grounding / counting — filter by text_prompt
+#         elif model_name in ['Strip-R-CNN', 'SM3Det', 'RemoteSAM', 'InstructSAM']:
+#             filtered = results[(results['model'] == model_name) &
+#                                (results['file_path'] == input_image_path) &
+#                                (results['text_prompt'] == args.get('text_prompt', ''))]
+#             if len(filtered):
+#                 result = filtered.values[0]
+
+#         # change detection / building extraction
+#         elif model_name in ['ChangeOS', 'ChangeOS_Building_Extraction']:
+#             if 'post_image_path' in args:
+#                 lookup_key = f"({input_image_path}, {args['post_image_path']})"
+#             else:
+#                 lookup_key = input_image_path
+#             filtered = results[(results['model'] == 'ChangeOS') & (results['file_path'] == lookup_key)]
+#             if len(filtered):
+#                 result = filtered.values[0]
+
+#         # SAM2 segmentation
+#         elif model_name == 'SAM2':
+#             filtered = results[(results['model'] == model_name) & (results['file_path'] == input_image_path)]
+#             if len(filtered):
+#                 result = filtered.values[0]
+#                 result = result[args['bbox']]
+
+#     except Exception as e:
+#         print(f"get_model_output error ({model_name}): {e}")
+
+#     if result is None:
+#         return 'Failed to call model'
+#     else:
+#         return result
+
 def get_model_output(model_name: str, input_image_path: str, **args):
+    import ast
+    import sys
     import pandas as pd
     from pathlib import Path as _Path
 
-    _csv_path = _Path(__file__).resolve().parent.parent.parent / 'benchmark' / 'model_results.csv'
-    results = pd.read_csv(_csv_path, sep=';')
+    csv_path = _Path(__file__).resolve().parent.parent.parent / 'benchmark' / 'model_results.csv'
+    results = pd.read_csv(csv_path, sep=';')
+
+    def _parse(cell):
+        # cells hold stringified Python literals (dict/list); empty -> NaN
+        if pd.isna(cell) or cell == '':
+            return None
+        return ast.literal_eval(cell)
+
     result = None
     try:
-        # classification — no text_prompt
         if model_name in ['MSCN', 'RemoteCLIP']:
-            filtered = results[(results['model'] == model_name) & (results['file_path'] == input_image_path)]
-            if len(filtered):
-                result = filtered.values[0]
+            row = results[(results['model'] == model_name) &
+                          (results['file_path'] == input_image_path)]
+            if len(row):
+                parsed = _parse(row.iloc[0]['result'])
+                # reconstruct the documented [model, path, class, conf, top5] shape
+                result = [model_name, input_image_path,
+                          parsed['predicted_class'], parsed['confidence'],
+                          parsed['top5_predictions']]
 
-        # detection / grounding / counting — filter by text_prompt
         elif model_name in ['Strip-R-CNN', 'SM3Det', 'RemoteSAM', 'InstructSAM']:
-            filtered = results[(results['model'] == model_name) &
-                               (results['file_path'] == input_image_path) &
-                               (results['text_prompt'] == args.get('text_prompt', ''))]
-            if len(filtered):
-                result = filtered.values[0]
+            row = results[(results['model'] == model_name) &
+                          (results['file_path'] == input_image_path) &
+                          (results['text_prompt'] == args.get('text_prompt'))]
+            if len(row):
+                raw = row.iloc[0]['result']
+                result = int(raw) if model_name == 'InstructSAM' else _parse(raw)
 
-        # change detection / building extraction
+        elif model_name == 'SAM2':
+            wanted_bbox = args.get('bbox')
+            candidates = results[(results['model'] == 'SAM2') &
+                                 (results['file_path'] == input_image_path)]
+            for _, row in candidates.iterrows():
+                if _parse(row['bbox']) == wanted_bbox:
+                    result = row['result']
+                    break
+
         elif model_name in ['ChangeOS', 'ChangeOS_Building_Extraction']:
             if 'post_image_path' in args:
                 lookup_key = f"({input_image_path}, {args['post_image_path']})"
             else:
                 lookup_key = input_image_path
-            filtered = results[(results['model'] == 'ChangeOS') & (results['file_path'] == lookup_key)]
-            if len(filtered):
-                result = filtered.values[0]
-
-        # SAM2 segmentation
-        elif model_name == 'SAM2':
-            filtered = results[(results['model'] == model_name) & (results['file_path'] == input_image_path)]
-            if len(filtered):
-                result = filtered.values[0]
-                result = result[args['bbox']]
+            row = results[(results['model'] == 'ChangeOS') &
+                          (results['file_path'] == lookup_key)]
+            if len(row):
+                result = row.iloc[0]['result']
 
     except Exception as e:
-        print(f"get_model_output error ({model_name}): {e}")
+        print(f"get_model_output error ({model_name}): {e}", file=sys.stderr)
 
     if result is None:
         return 'Failed to call model'
-    else:
-        return result
+    return result
 
 
 

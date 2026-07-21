@@ -134,7 +134,34 @@ def band_ratio(
 
     return f'Result saved at {TEMP_DIR / output_path}'
 
+@mcp.tool(description="""
+Batch-calculate water turbidity in NTU from multiple red-band raster files using the same method/coefficients.
 
+Parameters:
+    input_red_paths (list[str]): Paths to Red band raster files.
+    output_paths (list[str]): Relative output paths, one per input.
+    method (str): "linear", "power", or "log" — applied to all inputs.
+    a (float): Coefficient parameter, default 1.0.
+    b (float): Offset parameter, default 0.0.
+    n (float): Power parameter for power method, default 1.0.
+
+Returns:
+    list[str]: A list of result messages, as returned by `calculate_water_turbidity_ntu`.
+""")
+def calculate_batch_water_turbidity_ntu(
+    input_red_paths: list[str],
+    output_paths: list[str],
+    method: str = "linear",
+    a: float = 1.0,
+    b: float = 0.0,
+    n: float = 1.0
+) -> list[str]:
+    if len(input_red_paths) != len(output_paths):
+        raise ValueError("Number of input red paths and output paths must be equal")
+    return [
+        calculate_water_turbidity_ntu(red_path, out_path, method=method, a=a, b=b, n=n)
+        for red_path, out_path in zip(input_red_paths, output_paths)
+    ]
 
 
 @mcp.tool(description='''

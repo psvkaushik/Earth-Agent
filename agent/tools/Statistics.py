@@ -1663,7 +1663,30 @@ def image_division_mean(image_path1, image_path2=None, band1=1, band2=2):
 
     return float(np.nanmean(ratio))
 
+@mcp.tool(description="""
+Batch-compute pixelwise differences between multiple pairs of raster files.
 
+Parameters:
+    image_a_paths (list[str]): Paths to the first image in each pair.
+    image_b_paths (list[str]): Paths to the second image in each pair, same length/order as image_a_paths.
+    output_paths (list[str]): Relative output paths, one per pair.
+    uint8 (bool): Whether to normalize inputs to uint8 before differencing. Default False.
+
+Returns:
+    list[str]: A list of result messages, as returned by `calculate_tif_difference`.
+""")
+def calculate_batch_tif_difference(
+    image_a_paths: list[str],
+    image_b_paths: list[str],
+    output_paths: list[str],
+    uint8: bool = False
+) -> list[str]:
+    if not (len(image_a_paths) == len(image_b_paths) == len(output_paths)):
+        raise ValueError("Number of image_a paths, image_b paths, and output paths must be equal")
+    return [
+        calculate_tif_difference(a_path, b_path, out_path, uint8=uint8)
+        for a_path, b_path, out_path in zip(image_a_paths, image_b_paths, output_paths)
+    ]
 
 @mcp.tool(description=
     """
@@ -3216,6 +3239,50 @@ def apply_cloud_mask(sr_band_path, qa_pixel_path, output_path):
     
     return f'Result saved at {TEMP_DIR / output_path}'
 
+@mcp.tool(description="""
+Batch-apply Landsat 8 surface reflectance (SR_B*) radiometric correction to multiple bands.
+
+Parameters:
+    input_band_paths (list[str]): Paths to input reflectance band files.
+    output_paths (list[str]): Relative output paths, one per input (e.g. ["question17/radiometric_correction_2022-01-16.tif", ...]).
+
+Returns:
+    list[str]: A list of result messages (one per output), as returned by `radiometric_correction_sr`.
+""")
+def radiometric_correction_sr_batch(
+    input_band_paths: list[str],
+    output_paths: list[str]
+) -> list[str]:
+    if len(input_band_paths) != len(output_paths):
+        raise ValueError("Number of input bands and output paths must be equal")
+    return [
+        radiometric_correction_sr(band_path, out_path)
+        for band_path, out_path in zip(input_band_paths, output_paths)
+    ]
+
+
+@mcp.tool(description="""
+Batch-apply cloud/shadow mask to multiple Landsat 8 surface reflectance bands using paired QA_PIXEL bands.
+
+Parameters:
+    sr_band_paths (list[str]): Paths to surface reflectance bands (e.g., SR_B3 or SR_B5), one per date/file.
+    qa_pixel_paths (list[str]): Paths to QA_PIXEL bands, same length and order as sr_band_paths.
+    output_paths (list[str]): Relative output paths, one per input pair (e.g. ["question17/cloud_mask_2022-01-16.tif", ...]).
+
+Returns:
+    list[str]: A list of result messages (one per output), as returned by `apply_cloud_mask`.
+""")
+def apply_cloud_mask_batch(
+    sr_band_paths: list[str],
+    qa_pixel_paths: list[str],
+    output_paths: list[str]
+) -> list[str]:
+    if not (len(sr_band_paths) == len(qa_pixel_paths) == len(output_paths)):
+        raise ValueError("Number of SR bands, QA_PIXEL bands, and output paths must be equal")
+    return [
+        apply_cloud_mask(sr_path, qa_path, out_path)
+        for sr_path, qa_path, out_path in zip(sr_band_paths, qa_pixel_paths, output_paths)
+    ]
 
 if __name__ == "__main__":
     mcp.run()

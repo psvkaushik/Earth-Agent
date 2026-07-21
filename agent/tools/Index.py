@@ -1136,7 +1136,46 @@ def compute_tvdi(
         dst.write(tvdi, 1)
 
     return f'Result saved at {TEMP_DIR / output_path}'
+@mcp.tool(description="""
+Batch-compute TVDI (Temperature Vegetation Dryness Index) for multiple paired NDVI/LST raster files.
 
+Parameters:
+    ndvi_paths (list[str]): Paths to local NDVI GeoTIFFs (e.g., MODIS NDVI scaled by 0.0001), one per date.
+    lst_paths (list[str]): Paths to local LST GeoTIFFs (e.g., MODIS LST scaled by 0.02), same length/order as ndvi_paths.
+    output_paths (list[str]): Relative output paths, one per pair, e.g. ["question17/tvdi_2022-01-16.tif", ...].
+
+Returns:
+    list[str]: A list of result messages (one per output), as returned by `compute_tvdi`.
+""")
+def compute_batch_tvdi(
+    ndvi_paths: list[str],
+    lst_paths: list[str],
+    output_paths: list[str]
+) -> list[str]:
+    if not (len(ndvi_paths) == len(lst_paths) == len(output_paths)):
+        raise ValueError("Number of NDVI paths, LST paths, and output paths must be equal")
+    return [
+        compute_tvdi(ndvi_path, lst_path, out_path)
+        for ndvi_path, lst_path, out_path in zip(ndvi_paths, lst_paths, output_paths)
+    ]
+
+
+@mcp.tool(description="""
+Batch-calculate the percentage of extreme snow/ice loss areas from multiple binary maps.
+
+Parameters:
+    binary_map_paths (list[str]): Paths to binary raster images, one per date, where pixels with
+                                   value 1.0 represent extreme snow/ice loss areas.
+
+Returns:
+    list[float]: A list of extreme snow/ice loss percentages (range 0.0-1.0), one per input,
+                 as returned by `calc_extreme_snow_loss_percentage_from_binary_map`.
+""")
+def calc_batch_extreme_snow_loss_percentage_from_binary_map(binary_map_paths: list[str]) -> list[float]:
+    return [
+        calc_extreme_snow_loss_percentage_from_binary_map(path)
+        for path in binary_map_paths
+    ]
 
 if __name__ == "__main__":
     mcp.run() 
