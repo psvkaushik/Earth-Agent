@@ -1,5 +1,3 @@
-
-
 import os
 from dotenv import load_dotenv
 load_dotenv()
@@ -281,6 +279,25 @@ def event_to_log_entries(event):
     return entries
 
 
+def stream_assistant_text(trace_log_path, label, event):
+    """Write any assistant text found in this single event to the trace
+    file (and stdout) immediately, as ADK yields it -- rather than waiting
+    for the whole delegation call or the whole question to finish before
+    any reasoning becomes visible. This is a per-turn stream (whatever
+    ADK/the underlying model backend gives us per event), not necessarily
+    token-by-token -- true sub-turn token streaming would additionally
+    require RunConfig(streaming_mode=StreamingMode.SSE) on run_async, and
+    depends on the backend actually supporting SSE streaming."""
+    for entry in event_to_log_entries(event):
+        if entry["role"] == "assistant":
+            for item in entry["content"]:
+                if "content" in item and item["content"].strip():
+                    ts = datetime.now().strftime('%H:%M:%S')
+                    line = f"[{ts}] [{label}] (thinking) {item['content'].strip()}"
+                    write_trace(trace_log_path, line)
+                    print(line)
+
+
 def format_specialist_return(events) -> str:
     """Format the events generated during ONE delegation call into a single
     string for the orchestrator -- kept close to a raw ReAct trace (not a
@@ -421,24 +438,16 @@ def load_adk_config(config_path='./agent/config.json'):
     model_config = config['models'][0]
     llm_kwargs = dict(model_config.get('generate_args', {}))
     llm = LiteLlm(
-    model="openai/EVE-Instruct",
-    api_base=os.getenv("EVE_ENDPOINT"),
-    api_key="EMPTY",
-    temperature=0,
-    extra_headers=EVE_HEADERS,
-    timeout=120,        # hard ceiling per LLM call, in seconds
-    num_retries=1,       # don't let litellm silently retry-and-wait multiple times on top of that
-    max_tokens=4096,     # caps generation length — also curbs the "list all 85 paths" runaway case
-    **llm_kwargs,
-)
-    # llm = LiteLlm(
-    #     model="openai/EVE-Instruct",
-    #     api_base=os.getenv("EVE_ENDPOINT"),
-    #     api_key="EMPTY",
-    #     temperature=0,
-    #     extra_headers=EVE_HEADERS,
-    #     **llm_kwargs,
-    # )
+        model="openai/EVE-Instruct",
+        api_base=os.getenv("EVE_ENDPOINT"),
+        api_key="EMPTY",
+        temperature=0,
+        extra_headers=EVE_HEADERS,
+        timeout=120,        # hard ceiling per LLM call, in seconds
+        num_retries=1,      # don't let litellm silently retry-and-wait multiple times on top of that
+        max_tokens=4096,    # caps generation length -- also curbs runaway "list every path" turns
+        **llm_kwargs,
+    )
 
     mcp_server_params = {}
     for server_name, server_config in config['mcpServers'].items():
@@ -629,6 +638,7 @@ def build_kit_delegation_tool(kit_name, kit_agent, session_service, kit_sessions
             new_message=genai_types.Content(role="user", parts=[genai_types.Part(text=instructions)]),
         ):
             events.append(event)
+            stream_assistant_text(trace_log_path, kit_name.upper(), event)
 
         _current_subagent_traces.append({
             "kit": kit_name,
@@ -772,6 +782,7 @@ async def handle_question(orchestrator, session_service, kit_sessions_holder, qu
             new_message=genai_types.Content(role="user", parts=[genai_types.Part(text=full_query)]),
         ):
             orchestrator_events.append(event)
+            stream_assistant_text(trace_log_path, "ORCHESTRATOR", event)
             if event.is_final_response() and event.content and event.content.parts:
                 texts = [p.text for p in event.content.parts if getattr(p, "text", None)]
                 if texts:
