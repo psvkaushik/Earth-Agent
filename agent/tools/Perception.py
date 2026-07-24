@@ -8,11 +8,36 @@ from utils import read_image, read_image_uint8
 
 mcp = FastMCP()
 parser = argparse.ArgumentParser()
-parser.add_argument('--temp_dir', type=str)
+parser.add_argument('--temp_dir', type=str, default=None)
 args, unknown = parser.parse_known_args()
 
-TEMP_DIR = Path(args.temp_dir)
+# CHANGE: don't crash at import time just because the launcher forgot
+# --temp_dir. Fall back to a tmp/ directory next to this script. Previously
+# `Path(args.temp_dir)` with args.temp_dir == None raised TypeError before
+# FastMCP ever got a chance to register tools, which killed the whole MCP
+# session silently from the client's point of view (just "Connection closed").
+if args.temp_dir is None:
+    TEMP_DIR = Path(__file__).resolve().parent / "tmp"
+else:
+    TEMP_DIR = Path(args.temp_dir)
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+# CHANGE: anchor relative image paths against the project root rather than
+# whatever cwd this subprocess happens to inherit from its launcher. This
+# script lives at Earth-Agent/agent/tools/Perception.py, so the project
+# root is two levels up.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _resolve_path(path: str) -> str:
+    """Resolve a possibly-relative image/raster path against PROJECT_ROOT.
+    Leaves absolute paths untouched. Use this at the top of any tool that
+    actually touches the filesystem (rasterio.open, cv2.imread, etc.) —
+    without it, a path like "benchmark/data/question189/A.jpg" only
+    resolves correctly if this subprocess's cwd happens to be the project
+    root, which is not guaranteed."""
+    p = Path(path)
+    return str(p if p.is_absolute() else PROJECT_ROOT / p)
 
 
 @mcp.tool(description="""
@@ -53,6 +78,8 @@ def threshold_segmentation(input_image_path, threshold, output_path):
     import os
     import rasterio
     import numpy as np
+
+    input_image_path = _resolve_path(input_image_path)
 
     with rasterio.open(input_image_path) as src:
         image = src.read(1)
@@ -145,6 +172,7 @@ def count_above_threshold(file_path: str, threshold: float):
     """
     import numpy as np
     import rasterio
+    file_path = _resolve_path(file_path)
     with rasterio.open(file_path) as src:
         x = src.read(1)
     x = np.asarray(x)
@@ -194,6 +222,7 @@ def count_skeleton_contours(image_path):
     import cv2
     import numpy as np
     from skimage.morphology import skeletonize
+    image_path = _resolve_path(image_path)
     # Read image as grayscale
     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
 
@@ -389,7 +418,11 @@ def calculate_bbox_area(bboxes, gsd=None):
 def get_model_output(model_name: str, input_image_path: str, **args):
     import pandas as pd
 
-    results = pd.read_csv('/root/autodl-tmp/Earth-Agent/benchmark/model_results.csv', sep=';')
+    # CHANGE: was hardcoded to /root/autodl-tmp/Earth-Agent/... — a path
+    # from a different machine/container. Anchor to PROJECT_ROOT instead so
+    # this resolves correctly on this box (and any other) without editing
+    # source every time the deployment moves.
+    results = pd.read_csv(PROJECT_ROOT / 'benchmark' / 'model_results.csv', sep=';')
     result = None
     try:
         # classification
