@@ -58,20 +58,21 @@ for agent in ALL_SUB_AGENTS:
     print(f"  - {agent.name}: {agent.description}")
 
 _SUPERVISOR_SYSTEM_PROMPT = """\
-You are a geoscientist and the orchestrator for a multi-agent Earth-\
+You are the orchestrator_agent, and the orchestrator for a multi-agent Earth-\
 observation system. You are given multiple-choice questions about Earth \
 observation data analysis. You do not have perception/raster-analysis \
 tools yourself — route each question to the sub-agent(s) best suited to \
 it based on its content, pass along whatever context each sub-agent \
-needs, and combine their results to determine the correct choice.
+needs, and combine their results to determine the correct choice. Make sure to also extract the correct directory path from the question,and sub-agent responses and pass it to the sub-agents, rather than asking them to enumerate files themselves.
 
 Division of labor: a sub-agent's job is to compute the underlying fact \
 (a count, a class, a measurement) and state it directly. Your job is to \
 take that already-computed fact and match it against the answer choices \
 in the original question to pick the letter/option. Do not re-invoke a \
 sub-agent to "get the final answer" — once a sub-agent has given you a \
-direct value (e.g. "result: 3"), that value IS the fact; your remaining \
-work is purely matching it to a choice, not asking for more computation.
+result, that value IS the fact; your remaining work is to match it \
+against the answer choices you were given, not to ask for more \
+computation.
 
 ATTENTION:
 1. If a sub-agent or tool call returns an error, you may retry that call \
@@ -87,12 +88,37 @@ ATTENTION:
    you must reuse that exact full path "/path/to/file" in any subsequent \
    tool or sub-agent calls that need it — do not shorten, guess, or \
    reconstruct the path yourself.
-4. For every question you must commit to the single choice you think is \
-   most appropriate. Do not hedge, list multiple candidates, or explain \
-   your reasoning in the final message.
-5. Based on the options, question and the tool outputs, your final answer must be given in exactly this format, with nothing \
-   else in the message:
-<Answer>A/B/C/D/...</Answer>
+4. Three sub-agents are available: perception_agent (object/scene detection, \
+   segmentation), index_agent (spectral/biophysical index rasters — NDVI, \
+   EVI, NBR, NDWI, TVDI, etc. — from raw band inputs), and statistics_agent \
+   (numeric/statistical computation on any raster, including rasters that \
+   index_agent produced). index_agent only returns computed raster paths — \
+   it cannot answer numeric questions itself. If a question asks for a \
+   statistic *about* an index (a mean NDVI, a percentage of high-EVI area, \
+   an index threshold count, etc.), this requires two sequential sub-agent \
+   calls: first index_agent to produce the index raster, then \
+   statistics_agent with that exact returned path to compute the requested \
+   statistic. Do not call statistics_agent directly on raw band files \
+   expecting it to compute an index — it has no index-calculation tools.
+5. Every sub-agent carries its own `get_filelist` tool and can resolve a \
+   directory path itself. Pass sub-agents a directory path, not an \
+   enumerated file list, unless you already need to reference specific \
+   filenames individually (e.g. matching a pre/post pair by name).
+6. For every question you must commit to the single choice you think is \
+   most appropriate. Do not hedge or list multiple candidates.
+7. Your response must contain exactly two lines and nothing else:
+Line 1: computed value: Y coincides with choice X. <value Y>
+Line 2: <Answer>X</Answer>
+Do not add any other explanation, caveats, or commentary beyond these \
+two lines. In case of ambiguity, pick the choice most consistent with \
+the computed value and the question's context — still output only the \
+two lines above. In case of error, output only: <Answer>NO Answer</Answer>
+8. If a tool call fails, do not immediately retry the exact same call with \
+   the exact same arguments — this wastes calls and will fail identically. \
+   First check whether a *previous* tool result already gave you the \
+   correct input (e.g. a full saved path) that you failed to use verbatim \
+   in the failing call. If a retry with corrected arguments also fails, \
+   stop and report the failure rather than repeating the sequence again.
 """
 
 orchestrator = Agent(
@@ -133,14 +159,18 @@ class RunTrace:
         }
 
 
-def _first_text(event) -> str | None:
+# def _first_text(event) -> str | None:
+#     if not (event.content and event.content.parts):
+#         return None
+#     for part in event.content.parts:
+#         if getattr(part, "text", None):
+#             return part.text
+#     return None
+def _all_text(event) -> str | None:
     if not (event.content and event.content.parts):
         return None
-    for part in event.content.parts:
-        if getattr(part, "text", None):
-            return part.text
-    return None
-
+    texts = [p.text for p in event.content.parts if getattr(p, "text", None)]
+    return "\n".join(texts) if texts else None
 
 def _truncate(obj, limit=400) -> str:
     s = json.dumps(obj, default=str) if not isinstance(obj, str) else obj
@@ -198,7 +228,7 @@ async def trace_query(query: str, session_id: str | None = None) -> RunTrace:
                 print(f"   [escalate] {event.error_message}")
 
         if event.is_final_response():
-            text = _first_text(event)
+            text = _all_text(event)
             if text is not None:
                 trace.final_answer = text
             elif event.actions and event.actions.escalate:
@@ -217,10 +247,24 @@ async def trace_query(query: str, session_id: str | None = None) -> RunTrace:
 
 
 async def main():
+    # trace = await trace_query(
+    #     "Based on the following images, every image belongs to {Airport, BareLand, BaseballField, Beach, Bridge, Center, Church, Commercial, DenseResidential, Desert, Farmland, Forest, Industrial, Meadow, MediumResidential, Mountain, Park, Parking, Playground, Pond, Port, RailwayStation, Resort, River, School, SparseResidential, Square, Stadium, StorageTanks, Viaduct}, determine the number of images captured in park areas. benchmark/data/question190, A.2, B.3, C.5, D.6"
+    # )
+    # trace = await trace_query(
+    #     "Define a threshold of significant increase as 20 MW. Based on fire MaxFRP in Thailand from 2018-03-01 to 2018-03-30 and from 2018-08-01 to 2018-08-30, identify and map regions where fire intensity significantly increased and visulize these areas in the map, data_dir: benchmark/data/question181," \
+    #     "A.The northern highlands exhibited a significant increase in fire intensity, with 23 pixels surpassing the +20 MW threshold."
+    #         "B. The central plains showed no areas with a fire intensity increase greater than 20 MW."
+    #         "C. The southern peninsula had more than 100 pixels with a MaxFRP increase above 20 MW."
+    #         "D. The eastern coastal region saw 5 pixels exceed the +20 MW increase threshold."
+    #         "E. The entire country showed no regions with a MaxFRP increase greater than 20 MW.")
+
     trace = await trace_query(
-        "Determining the number of images captured in industrial areas. The relevant data is stored in benchmark/data/question189. choices : A.3, B.2, C.6, D.5"
-    )
-    print(json.dumps(trace.as_summary(), indent=2, default=str))
+        """Based on temperature and vegetation data (NDVI and LST) from the agricultural region near Urumqi, Xinjiang between 2019 and 2023,  first apply the Temperature-Vegetation Dryness Index (TVDI) method by constructing a scatter plot of NDVI versus LST for each day, and calculate the TVDI value for each pixel to reflect the dryness condition and then calculate the annual average of TVDI and perform linear analysis on the annual average value data to best describes the annual trend. benchmark/data/question1
+        A. Increasing dryness at 0.015 per year,
+        B. Decreasing dryness at 0.037 per year,
+        C. Decreasing dryness at 0.006 per year",
+        D. No significant trend observed""")
+    # print(json.dumps(trace.as_summary(), indent=2, default=str))
 
 
 if __name__ == "__main__":

@@ -12,19 +12,14 @@ from mcp import StdioServerParameters
 # pkgutil/importlib loader loads it), regardless of where the process
 # is launched from.
 from .llm_init import llm
+from .common_tools import PROJECT_ROOT, get_filelist, FILELIST_USAGE_NOTE
 
 logger = logging.getLogger(__name__)
 
-# CHANGE: anchor a fixed PROJECT_ROOT, independent of process cwd. This file
-# lives at Earth-Agent/agents/subagents/sub_agent_perception.py, so the
-# project root is two levels up. Any tool here that touches the real
-# filesystem (get_filelist, and anything similar you add later) should
-# resolve relative paths against this, not against whatever directory the
-# process happened to be launched from — otherwise a path like
-# "benchmark/data/question189" only works when you run from Earth-Agent/
-# itself, and silently breaks (or worse, crashes the sub-agent node) when
-# run from agents/ or anywhere else.
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# NOTE: transfer-back-to-orchestrator on turn completion is enforced in code
+# (see agent wiring / callback, not in this prompt) — it used to be a prompt
+# instruction here but that was unreliable, so don't reintroduce a prompt-side
+# "you must call transfer_to_agent" block; the harness handles it now.
 
 
 _PERCEPTION_AGENT_PROMPT = """\
@@ -51,6 +46,8 @@ pile of raw per-file results — it needs the number/class/value itself, \
 already computed, stated plainly. Do not narrate your reasoning at \
 length — the orchestrator needs a result it can act on, not a report for \
 a human.
+
+""" + FILELIST_USAGE_NOTE + """
 
 ## Available tools
 
@@ -83,8 +80,11 @@ Raster/geometry utilities (deterministic, no ML):
 - `bboxes2centroids` — convert boxes to center points.
 - `centroid_distance_extremes` — closest/farthest centroid pair.
 - `calculate_bbox_area` — sum box areas, in pixels^2 or m^2 if GSD given.
+
+File utility:
 - `get_filelist` — list files in a directory (e.g. an image folder) before \
-  deciding which files to run other tools on.
+  deciding which files to run other tools on. See the file-discovery note \
+  above for when to enumerate vs. just report the directory.
 
 ## Execution principles
 
@@ -114,40 +114,15 @@ Raster/geometry utilities (deterministic, no ML):
 
 ## Output format
 
-Base your final answer on the orchestrator's original question, not on the raw tool outputs. If the orchestrator asked "how many X", your result is a number; if it asked "what class is this", your result is a class. Give your final answer and along with it the reasoning you used to derive it from the tool outputs. If a tool failed or returned an empty result, report that instead of fabricating an answer.
+Base your final answer on the orchestrator's original question, not the \
+raw tool outputs. If asked "how many XX", your result is a number; if \
+asked "what class", your result is a class. State the result plainly, \
+then 1-2 sentences of the reasoning/tool outputs that support it — not a \
+full narration. If a tool failed or returned empty, report that instead \
+of fabricating an answer. End with:
+
+RESULT: <your plainly stated answer + 1-2 sentences of support>
 """
-
-
-def get_filelist(dir_path: str):
-    """
-    Returns a list of files in the specified directory.
-
-    Parameters:
-        dir_path (str): Path to the directory. May be given relative to the
-            project root (e.g. "benchmark/data/question189") — it will be
-            resolved against PROJECT_ROOT regardless of the process's cwd,
-            so it works the same whether you run from Earth-Agent/,
-            Earth-Agent/agents/, or anywhere else.
-
-    Returns:
-        list: List of file names in the directory (dotfiles excluded), or
-        a dict with an "error" key describing what went wrong. Returning a
-        dict on failure rather than raising is deliberate — an uncaught
-        exception here crashes the whole sub-agent node ("Dynamic node
-        perception_agent failed") with no detail the orchestrator can act
-        on; a returned error string at least gives it something to retry
-        or report against.
-    """
-    resolved = dir_path if os.path.isabs(dir_path) else os.path.join(PROJECT_ROOT, dir_path)
-
-    try:
-        return sorted([f for f in os.listdir(resolved) if not f.startswith('.')])
-    except FileNotFoundError:
-        return {"error": f"Directory not found: {resolved} (from input '{dir_path}')"}
-    except NotADirectoryError:
-        return {"error": f"Not a directory: {resolved}"}
-    except OSError as e:
-        return {"error": f"Could not list {resolved}: {e}"}
 
 
 toolset = [McpToolset(
@@ -160,17 +135,23 @@ toolset = [McpToolset(
                              # McpToolset init rather than a loud crash.
                              args=[
                                  "/home/egm/Desktop/Earth-Agent/agent/tools/Perception.py",
-                                 # CHANGE: Perception.py does `TEMP_DIR =
-                                 # Path(args.temp_dir)` with no default —
-                                 # without this flag the subprocess crashes
-                                 # on import, the MCP session fails to
-                                 # connect, and the agent silently falls
-                                 # back to only its Python-side tools
-                                 # (get_filelist) with no real analysis.
+                                 # All three sub-agents (perception, statistics,
+                                 # index) now point at the SAME shared temp dir.
+                                 # A raster written by one sub-agent's tool must
+                                 # be readable by another sub-agent's tool for a
+                                 # single question — separate per-agent temp
+                                 # dirs (the old tmp/perception, tmp/statistics,
+                                 # tmp/index split) made that fail silently
+                                 # whenever a path crossed agent boundaries.
+                                 # Perception.py itself no longer crashes without
+                                 # this flag either (it falls back to a default
+                                 # via common.py's parse_temp_dir), but pass it
+                                 # explicitly so all three agents agree even if
+                                 # launched independently of this wiring.
                                  "--temp_dir",
-                                 os.path.join(PROJECT_ROOT, "tmp", "perception"),
+                                 os.path.join(PROJECT_ROOT, "tmp", "shared"),
                              ]),
-                             timeout=300))]
+                             timeout=60))]
 
 
 def _fetch_agent(toolset) -> Optional[Agent]:
@@ -182,7 +163,8 @@ def _fetch_agent(toolset) -> Optional[Agent]:
                 instruction=_PERCEPTION_AGENT_PROMPT,
                 tools=toolset + [get_filelist],
                 disallow_transfer_to_peers=True,
-                # mode='single_turn',
+                # disallow_transfer_to_parent=True,
+                mode='single_turn',
             )
         else:
             logger.warning("Perception agent not initialized due to missing toolset.")
