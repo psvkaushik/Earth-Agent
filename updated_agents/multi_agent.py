@@ -45,6 +45,7 @@ if _PROJECT_ROOT not in sys.path:
 from updated_agents.subagents import ALL_SUB_AGENTS, llm
 from updated_agents.subagents.eve_patch import apply as apply_eve_patch
 from updated_agents.subagents.state_tracking import seed_question_dir, with_known_paths
+from updated_agents import tracing
 
 load_dotenv()
 apply_eve_patch()
@@ -60,6 +61,15 @@ USER_ID = "user_1"
 
 if not ALL_SUB_AGENTS:
     raise SystemExit("No sub-agents loaded — check the warnings/errors above.")
+
+# Tells tracing.py which "tool" names are actually other sub-agents wrapped
+# as AgentTool, not real MCP tools — so a sub-agent handoff (e.g. the
+# orchestrator invoking "index_agent") is written to the human-readable
+# fulltrace but excluded from the flattened, metrics-compatible conversation
+# log, matching how the original single-agent traces (and agents/'s intended
+# design, per tracing.py's own docstring) never logged an agent call as if
+# it were a tool call. Must run before any question is processed.
+tracing.register_subagent_names(agent.name for agent in ALL_SUB_AGENTS)
 
 print("\nSub-agents ready:")
 for agent in ALL_SUB_AGENTS:
@@ -150,6 +160,16 @@ orchestrator = Agent(
     description="An orchestrator agent that routes user queries to its sub-agents based on the query content.",
     instruction=with_known_paths(_SUPERVISOR_SYSTEM_PROMPT),
     before_agent_callback=seed_question_dir,
+    # Registered on every agent (orchestrator + all sub-agents, see each
+    # sub_agent_*.py) — see tracing.py's own docstring for why: ADK's event
+    # stream only ever shows a sub-agent's single collapsed AgentTool
+    # call/response at the orchestrator level, never the real tool calls it
+    # made internally. before_tool_callback also enforces the identical-call
+    # loop guard (tracing.MAX_IDENTICAL_CALLS) at the orchestrator's own
+    # level (e.g. repeatedly re-invoking the same sub-agent with identical
+    # args).
+    before_tool_callback=tracing.before_tool_callback,
+    after_tool_callback=tracing.after_tool_callback,
 )
 
 session_service = InMemorySessionService()
@@ -195,7 +215,26 @@ def _truncate(obj, limit=400) -> str:
 
 async def trace_query(query: str, session_id: str | None = None) -> RunTrace:
     """Streams a query through the orchestrator, printing every observable
-    step live, and returns a RunTrace with the full structured record."""
+    step live, and returns a RunTrace with the full structured record.
+
+    NOTE: this reads function_call/function_response straight off the
+    top-level event stream, which — same limitation as the original
+    agents/multi_agent.py demo runner — only ever shows each sub-agent's own
+    single collapsed AgentTool call/response, not the real tool calls made
+    INSIDE that sub-agent (get_filelist, compute_tvdi, etc.). It's fine for
+    a quick manual/interactive query where you mainly want to see agent
+    hand-offs and reasoning. For a real full trace with every underlying
+    tool call captured (what the benchmark run needs), use
+    updated_agents/benchmark_ma.py's run_one_question, which drives the same
+    orchestrator/runner but records via tracing.QuestionTrace instead —
+    registered on every agent, tracing.before/after_tool_callback see inside
+    a sub-agent's own execution regardless of who's "on top" of the call
+    stack, which no amount of top-level event-stream reading here ever
+    could. This function's own tracing.* callbacks (registered on the
+    orchestrator/sub-agents in this same module) simply no-op for a
+    trace_query() session, since no tracing.QuestionTrace is registered for
+    it in tracing.active_traces.
+    """
     session_id = session_id or f"session_{uuid.uuid4().hex}"
     await session_service.create_session(app_name=APP_NAME, user_id=USER_ID, session_id=session_id)
 

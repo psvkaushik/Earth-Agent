@@ -11,9 +11,10 @@ from mcp import StdioServerParameters
 # part of the updated_agents.subagents package (which is how __init__.py's
 # pkgutil/importlib loader loads it), regardless of where the process
 # is launched from.
+from .. import tracing
 from .llm_init import llm
 from .common_tools import PROJECT_ROOT, get_filelist, FILELIST_USAGE_NOTE
-from .state_tracking import after_tool_callback, with_known_paths
+from .state_tracking import combined_after_tool_callback, with_known_paths
 
 logger = logging.getLogger(__name__)
 
@@ -168,7 +169,14 @@ def _fetch_agent(toolset) -> Optional[Agent]:
                 disallow_transfer_to_peers=True,
                 # disallow_transfer_to_parent=True,
                 mode='single_turn',
-                after_tool_callback=after_tool_callback,
+                # tracing.before/after_tool_callback: real tool-call capture
+                # + identical-call loop guard (see multi_agent.py's
+                # register_subagent_names comment for why this is needed on
+                # every agent). state_tracking.after_tool_callback: records
+                # "Result saved at X" paths into shared session state — runs
+                # after tracing's, both are pure observers (return None).
+                before_tool_callback=tracing.before_tool_callback,
+                after_tool_callback=combined_after_tool_callback,
             )
         else:
             logger.warning("Perception agent not initialized due to missing toolset.")

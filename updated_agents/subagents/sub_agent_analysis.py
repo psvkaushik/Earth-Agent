@@ -7,9 +7,10 @@ from google.adk.tools.mcp_tool import McpToolset
 from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
 from mcp import StdioServerParameters
 
+from .. import tracing
 from .llm_init import llm
 from .common_tools import PROJECT_ROOT, get_filelist, FILELIST_USAGE_NOTE
-from .state_tracking import after_tool_callback, with_known_paths
+from .state_tracking import combined_after_tool_callback, with_known_paths
 
 logger = logging.getLogger(__name__)
 
@@ -177,7 +178,14 @@ def _fetch_agent(toolset) -> Optional[Agent]:
                 tools=toolset + [get_filelist],
                 disallow_transfer_to_peers=True,
                 mode='single_turn',
-                after_tool_callback=after_tool_callback,
+                # tracing.before/after_tool_callback: real tool-call capture
+                # + identical-call loop guard (see multi_agent.py's
+                # register_subagent_names comment for why this is needed on
+                # every agent). state_tracking.after_tool_callback: records
+                # "Result saved at X" paths into shared session state — runs
+                # after tracing's, both are pure observers (return None).
+                before_tool_callback=tracing.before_tool_callback,
+                after_tool_callback=combined_after_tool_callback,
             )
         else:
             logger.warning("Analysis agent not initialized due to missing toolset.")

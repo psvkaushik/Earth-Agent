@@ -19,14 +19,16 @@ can't be forgotten or mistyped because the model never has to retype it —
 it's just always there, code-populated, in the current prompt.
 
 USAGE:
-    from .state_tracking import after_tool_callback, with_known_paths, seed_question_dir
+    from .state_tracking import combined_after_tool_callback, with_known_paths, seed_question_dir
 
-    instruction=with_known_paths(_SOME_AGENT_PROMPT)   # instead of a plain string
-    after_tool_callback=after_tool_callback            # on every sub-agent
-    before_agent_callback=seed_question_dir            # on the orchestrator only
+    instruction=with_known_paths(_SOME_AGENT_PROMPT)     # instead of a plain string
+    after_tool_callback=combined_after_tool_callback     # on every sub-agent
+    before_agent_callback=seed_question_dir              # on the orchestrator only
 """
 import json
 import re
+
+from .. import tracing
 
 # Excludes quotes/brackets/commas, not just whitespace: this pattern is also
 # matched against raw (un-parsed) JSON-encoded text — e.g. the response
@@ -104,6 +106,25 @@ def after_tool_callback(tool, args, tool_context, tool_response):
         if dir_path:
             tool_context.state["question_dir"] = dir_path
 
+    return None
+
+
+def combined_after_tool_callback(tool, args, tool_context, tool_response):
+    """Runs both `tracing.after_tool_callback` (real tool-call capture for
+    the benchmark's .log/fulltrace — see updated_agents/tracing.py) and this
+    module's own `after_tool_callback` (path-registry state), as a single
+    explicit function.
+
+    Deliberately NOT relying on passing `after_tool_callback=[fn1, fn2]` as
+    a list to ADK's LlmAgent — that's accepted by the field's type
+    signature, but whether the runtime actually invokes every callback in
+    the list (vs. e.g. stopping at the first non-None return) wasn't worth
+    the time to verify against this ADK version when a single explicit
+    function removes the ambiguity entirely. Attach this to every
+    sub-agent: `after_tool_callback=combined_after_tool_callback`.
+    """
+    tracing.after_tool_callback(tool, args, tool_context, tool_response)
+    after_tool_callback(tool, args, tool_context, tool_response)
     return None
 
 
